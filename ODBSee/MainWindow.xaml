@@ -1,0 +1,109 @@
+﻿<Window x:Class="ODBSee.MainWindow"
+        xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        xmlns:d="http://schemas.microsoft.com/expression/blend/2008"
+        xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006"
+        xmlns:local="clr-namespace:ODBSee"
+        mc:Ignorable="d"
+        Title="ODBSee" Height="600" Width="1000" MinWidth="400"
+        TextOptions.TextFormattingMode="Display"
+        xmlns:wf="clr-namespace:System.Windows.Forms;assembly=System.Windows.Forms"
+        xmlns:wfi="clr-namespace:System.Windows.Forms.Integration;assembly=WindowsFormsIntegration">
+
+
+    <Grid Background="#F5F5F5">
+        <Grid.RowDefinitions>
+            <RowDefinition Height="150"/>
+            <RowDefinition Height="*"/>
+            <RowDefinition Height="32"/>
+        </Grid.RowDefinitions>
+
+        <Grid.ColumnDefinitions>
+            <ColumnDefinition Width="200"/>
+            <ColumnDefinition Width="*"/>
+            <ColumnDefinition Width="180"/>
+        </Grid.ColumnDefinitions>
+
+        <Border Grid.Row="0" Grid.Column="0" Padding="15,10" Background="White" BorderBrush="#DDD" BorderThickness="0,0,1,1">
+            <StackPanel>
+                <Button x:Name="BtnDatasource" 
+                    Content="Select Datasource..." 
+                    Padding="5,4" 
+                    Margin="0,0,0,10"
+                    Click="BtnDatasource_Click">
+                    <Button.ContextMenu>
+                        <ContextMenu x:Name="DsnMenu" />
+                    </Button.ContextMenu>
+                </Button>
+
+                <TextBlock Text="User" FontSize="11" Foreground="#666" Margin="0,0,0,2"/>
+                <TextBox x:Name="TxtUser" Margin="0,0,0,8" Padding="3"/>
+
+                <TextBlock Text="Password" FontSize="11" Foreground="#666" Margin="0,0,0,2"/>
+                <PasswordBox x:Name="TxtPass" Padding="3"/>
+            </StackPanel>
+        </Border>
+
+        <Border Grid.Row="0" Grid.Column="1" Padding="10" Background="White" BorderBrush="#DDD" BorderThickness="0,0,0,1">
+            <TextBox x:Name="TxtQuery"
+                 FontFamily="Consolas" 
+                 FontSize="13"
+                 AcceptsReturn="True"
+                 TextWrapping="Wrap"
+                 VerticalScrollBarVisibility="Auto"
+                 MinHeight="105"
+                 Padding="8"
+                 BorderBrush="#CCC"
+                 Text="select * from "/>
+        </Border>
+
+        <Border Grid.Row="0" Grid.Column="2" Padding="15,10" Background="White" BorderBrush="#DDD" BorderThickness="1,0,0,1">
+            <StackPanel>
+                <UniformGrid Columns="2" Margin="0,0,0,10">
+                    <Button x:Name="BtnOpen" Content="Open" Click="BtnOpen_Click" Margin="0,0,2,0" Padding="5,3"/>
+                    <Button x:Name="BtnSave" Content="Save" Click="BtnSave_Click" Margin="2,0,0,0" Padding="5,3"/>
+                </UniformGrid>
+
+                <DockPanel LastChildFill="True" Margin="0,0,0,10">
+                    <TextBlock Text="Max Rows" VerticalAlignment="Center" Margin="0,0,10,0" FontSize="11"/>
+                    <TextBox x:Name="TxtMaxRows" Text="1000" Padding="3" HorizontalContentAlignment="Center"/>
+                </DockPanel>
+
+                <Button x:Name="BtnExecute" 
+                    Background="#007ACC" 
+                    Foreground="White" 
+                    BorderThickness="0"
+                    FontWeight="Bold" 
+                    Padding="5,8"
+                    Click="BtnExecute_Click"
+                    ToolTip="Ctrl+Enter while typing also works :)">
+                    <TextBlock Text="▶ Execute" />
+                </Button>
+            </StackPanel>
+        </Border>
+
+        <!--Using winforms here because it runs infinitely better-->
+        <Grid Grid.Row="1" Grid.ColumnSpan="3" Background="White">
+            <wfi:WindowsFormsHost x:Name="Host">
+                <wf:DataGridView x:Name="WfGrid" />
+            </wfi:WindowsFormsHost>
+        </Grid>
+
+        <StatusBar Grid.Row="2" Grid.ColumnSpan="3" Background="#EEE" BorderThickness="0,1,0,0" BorderBrush="#CCC">
+            <StatusBarItem Margin="5,0">
+                <TextBlock x:Name="StatusConnection" Text="Disconnected" Foreground="#888"/>
+            </StatusBarItem>
+            <Separator/>
+            <StatusBarItem>
+                <TextBlock x:Name="StatusInfo" Text="Ready"/>
+            </StatusBarItem>
+            <StatusBarItem HorizontalAlignment="Right">
+                <StackPanel Orientation="Horizontal">
+                    <TextBlock x:Name="StatusRowCount" Text="0 Rows" VerticalAlignment="Center" Margin="0,0,10,0"/>
+                    <Button x:Name="BtnExport" Content="Export" Padding="10,2" Margin="0,0,5,0" Click="BtnExport_Click"/>
+                </StackPanel>
+            </StatusBarItem>
+        </StatusBar>
+    </Grid>
+
+</Window>
