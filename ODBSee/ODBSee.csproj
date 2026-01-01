@@ -7,7 +7,24 @@
     <ImplicitUsings>enable</ImplicitUsings>
     <UseWPF>true</UseWPF>
     <UseWindowsForms>true</UseWindowsForms>
+    <ApplicationIcon>odbsee_logo.ico</ApplicationIcon>
   </PropertyGroup>
+
+  <PropertyGroup Condition="'$(Configuration)' == 'Release'">
+    <PublishSingleFile>true</PublishSingleFile>
+    <SelfContained>true</SelfContained>
+    <RuntimeIdentifier>win-x64</RuntimeIdentifier>
+
+    <IncludeNativeLibrariesForSelfExtract>true</IncludeNativeLibrariesForSelfExtract>
+
+    <DebugType>none</DebugType>
+    <DebugSymbols>false</DebugSymbols>
+
+  </PropertyGroup>
+
+  <ItemGroup>
+    <Content Include="odbsee_logo.ico" />
+  </ItemGroup>
 
   <ItemGroup>
     <PackageReference Include="System.Data.Odbc" Version="10.0.1" />
