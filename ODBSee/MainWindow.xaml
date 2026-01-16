@@ -44,17 +44,25 @@
             </StackPanel>
         </Border>
 
-        <Border Grid.Row="0" Grid.Column="1" Padding="10" Background="White" BorderBrush="#DDD" BorderThickness="0,0,0,1">
-            <TextBox x:Name="TxtQuery"
-                 FontFamily="Consolas" 
-                 FontSize="13"
-                 AcceptsReturn="True"
-                 TextWrapping="Wrap"
-                 VerticalScrollBarVisibility="Auto"
-                 MinHeight="105"
-                 Padding="8"
-                 BorderBrush="#CCC"
-                 Text="select * from "/>
+        <Border Grid.Row="0" Grid.Column="1" Background="White" BorderBrush="#DDD" BorderThickness="0,0,0,1">
+            <Grid Margin="0,0,0,10">
+                <TabControl x:Name="QueryTabs" BorderThickness="1" Background="White" />
+
+                <Button Content="+" 
+                    HorizontalAlignment="Right" 
+                    VerticalAlignment="Top"
+                    Width="50" Height="18" 
+                    Margin="0,2,5,0"
+                    Click="AddNewTab_Click" 
+                    ToolTip="New Tab"
+                    Background="#EEE" BorderBrush="#CCC"
+                    Panel.ZIndex="1"
+                    Padding="0"
+                    VerticalContentAlignment="Center"
+                    HorizontalContentAlignment="Center"
+                    FontSize="10"
+                    FontWeight="Bold"/>
+            </Grid>
         </Border>
 
         <Border Grid.Row="0" Grid.Column="2" Padding="15,10" Background="White" BorderBrush="#DDD" BorderThickness="1,0,0,1">

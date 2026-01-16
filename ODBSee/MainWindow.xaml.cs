@@ -5,9 +5,13 @@ using System.Reflection;
 using System.Text;
 using System.Windows;
 using System.Windows.Controls;
+using Button = System.Windows.Controls.Button;
+using Label = System.Windows.Controls.Label;
 using MessageBox = System.Windows.MessageBox;
 using OpenFileDialog = Microsoft.Win32.OpenFileDialog;
+using Orientation = System.Windows.Controls.Orientation;
 using SaveFileDialog = Microsoft.Win32.SaveFileDialog;
+using TextBox = System.Windows.Controls.TextBox;
 using WinForms = System.Windows.Forms;
 
 namespace ODBSee
@@ -22,10 +26,15 @@ namespace ODBSee
         private int _lastSortColumnIndex = -1;
         private bool _sortAscending = true;
 
+        private OdbcCommand _currentCommand;
+
         public MainWindow()
         {
             InitializeComponent();
             SetupWinFormsGrid();
+
+            QueryTabs.Items.Clear(); // Remove the placeholder from XAML
+            CreateNewTab("Query 1", "select * from ");
         }
 
         private void SetupWinFormsGrid()
@@ -42,9 +51,6 @@ namespace ODBSee
 
             //listener for manual copy method
             WfGrid.KeyDown += WfGrid_KeyDown;
-
-            //listener for "execute" shortcut
-            TxtQuery.KeyDown += TxtQuery_KeyDown;
 
             typeof(DataGridView).GetProperty("DoubleBuffered", BindingFlags.Instance | BindingFlags.NonPublic)
                 ?.SetValue(WfGrid, true, null);
@@ -96,16 +102,27 @@ namespace ODBSee
 
         private async void ExecuteQuery()
         {
-            if (string.IsNullOrEmpty(_selectedDsn)) return;
+            if (_currentCommand != null)
+            {
+                try
+                {
+                    _currentCommand.Cancel();
+                    StatusInfo.Text = "Previous query cancelled. Starting new...";
+                }
+                catch { /* Ignore cancellation errors */ }
+            }
 
-            var queryText = TxtQuery.Text;
+            var activeBox = GetCurrentQueryBox();
+            if (activeBox == null || string.IsNullOrEmpty(_selectedDsn)) return;
+
+            var queryText = activeBox.Text;
             var userId = TxtUser.Text;
             var password = TxtPass.Password;
             int.TryParse(TxtMaxRows.Text, out var maxRows);
             if (maxRows <= 0) maxRows = 1000;
 
             StatusInfo.Text = "Executing Query...";
-            var connString = $"DSN={_selectedDsn};Uid={userId};Pwd={password};";
+            var connString = $"DSN={_selectedDsn};Uid={userId};Pwd={password};Connect Timeout=300;";
 
             try
             {
@@ -151,6 +168,8 @@ namespace ODBSee
             using var conn = new OdbcConnection(connString);
             conn.Open();
             using var cmd = new OdbcCommand(sql, conn);
+            _currentCommand = cmd;
+            cmd.CommandTimeout = 300; //5 mins
             using var reader = cmd.ExecuteReader();
             for (var i = 0; i < reader.FieldCount; i++)
                 cols.Add(reader.GetName(i));
@@ -163,6 +182,7 @@ namespace ODBSee
                 rows.Add(row);
                 count++;
             }
+            _currentCommand = null;
             return (cols, rows);
         }
 
@@ -228,7 +248,7 @@ namespace ODBSee
                 try
                 {
                     var fileContent = File.ReadAllText(openFileDialog.FileName);
-                    TxtQuery.Text = fileContent;
+                    CreateNewTab(Path.GetFileName(openFileDialog.FileName), fileContent);
                     StatusInfo.Text = $"Loaded: {Path.GetFileName(openFileDialog.FileName)}";
                 }
                 catch (Exception ex)
@@ -240,8 +260,9 @@ namespace ODBSee
 
         private void BtnSave_Click(object sender, RoutedEventArgs e)
         {
+            var activeBox = GetCurrentQueryBox();
             // Don't bother if the box is empty
-            if (string.IsNullOrWhiteSpace(TxtQuery.Text))
+            if (activeBox == null || string.IsNullOrWhiteSpace(activeBox.Text))
             {
                 MessageBox.Show("There is no query text to save.", "Warning", MessageBoxButton.OK, MessageBoxImage.Warning);
                 return;
@@ -260,8 +281,14 @@ namespace ODBSee
             {
                 try
                 {
-                    File.WriteAllText(saveFileDialog.FileName, TxtQuery.Text);
+                    File.WriteAllText(saveFileDialog.FileName, activeBox.Text);
                     StatusInfo.Text = $"Saved: {Path.GetFileName(saveFileDialog.FileName)}";
+
+                    if (QueryTabs.SelectedItem is TabItem currentTab && currentTab.Header is StackPanel sp)
+                    {
+                        if (sp.Children[0] is Label lbl)
+                            lbl.Content = Path.GetFileName(saveFileDialog.FileName);
+                    }
                 }
                 catch (Exception ex)
                 {
@@ -354,6 +381,100 @@ namespace ODBSee
                 return $"\"{field.Replace("\"", "\"\"")}\"";
             }
             return field;
+        }
+
+        private TextBox GetCurrentQueryBox()
+        {
+            if (QueryTabs.SelectedItem is TabItem currentTab)
+            {
+                // If you set the TextBox as the Content of the TabItem
+                return currentTab.Content as TextBox;
+            }
+            return null;
+        }
+
+        // Logic for the [+] Button
+        private void AddNewTab_Click(object sender, RoutedEventArgs e)
+        {
+            CreateNewTab("New Query", "select * from ");
+        }
+
+        private void CreateNewTab(string header, string content)
+        {
+            var newBox = new TextBox
+            {
+                Text = content,
+                FontFamily = new System.Windows.Media.FontFamily("Consolas"),
+                FontSize = 13,
+                AcceptsReturn = true,
+                Padding = new Thickness(8),
+                BorderThickness = new Thickness(0),
+                TextWrapping = TextWrapping.Wrap,
+                VerticalScrollBarVisibility = ScrollBarVisibility.Auto
+            };
+            newBox.KeyDown += TxtQuery_KeyDown;
+
+            var headerStack = new StackPanel { Orientation = Orientation.Horizontal };
+
+            // FIX: Using Label because TextBlock does NOT have MouseDoubleClick
+            var titleLabel = new Label
+            {
+                Content = header,
+                VerticalAlignment = VerticalAlignment.Center,
+                Padding = new Thickness(0),
+                MinWidth = 40
+            };
+
+            // DOUBLE CLICK TO RENAME LOGIC
+            titleLabel.MouseDoubleClick += (s, e) =>
+            {
+                var editBox = new TextBox { Text = titleLabel.Content.ToString(), MinWidth = 60 };
+                headerStack.Children.Insert(0, editBox);
+                headerStack.Children.Remove(titleLabel);
+                editBox.Focus();
+                editBox.SelectAll();
+
+                void FinishRename()
+                {
+                    if (headerStack.Children.Contains(editBox))
+                    {
+                        titleLabel.Content = string.IsNullOrWhiteSpace(editBox.Text) ? "Untitled" : editBox.Text;
+                        headerStack.Children.Insert(0, titleLabel);
+                        headerStack.Children.Remove(editBox);
+                    }
+                }
+
+                editBox.KeyDown += (s2, e2) => { if (e2.Key == System.Windows.Input.Key.Enter) FinishRename(); };
+                editBox.LostFocus += (s2, e2) => FinishRename();
+            };
+
+            var closeBtn = new Button
+            {
+                Content = "×",
+                Margin = new Thickness(10, 0, 0, 0),
+                Padding = new Thickness(2, 0, 2, 0),
+                Background = System.Windows.Media.Brushes.Transparent,
+                BorderThickness = new Thickness(0),
+                FontWeight = FontWeights.Bold,
+                VerticalAlignment = VerticalAlignment.Center
+            };
+
+            // Create the TabItem first so the button can reference it
+            var newTab = new TabItem { Content = newBox };
+
+            // FIX: Remove 'newTab' specifically, not just the 'SelectedItem'
+            closeBtn.Click += (s, e) =>
+            {
+                if (QueryTabs.Items.Count > 1)
+                    QueryTabs.Items.Remove(newTab);
+            };
+
+            headerStack.Children.Add(titleLabel);
+            headerStack.Children.Add(closeBtn);
+            newTab.Header = headerStack;
+
+            QueryTabs.Items.Add(newTab);
+            QueryTabs.SelectedItem = newTab;
         }
     }
 }
