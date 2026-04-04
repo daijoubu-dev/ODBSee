@@ -46,7 +46,7 @@
 
         <Border Grid.Row="0" Grid.Column="1" Background="White" BorderBrush="#DDD" BorderThickness="0,0,0,1">
             <Grid Margin="0,0,0,10">
-                <TabControl x:Name="QueryTabs" BorderThickness="1" Background="White" />
+                <TabControl x:Name="QueryTabs" BorderThickness="1" Background="White" SelectionChanged="QueryTabs_SelectionChanged" />
 
                 <Button Content="+" 
                     HorizontalAlignment="Right" 

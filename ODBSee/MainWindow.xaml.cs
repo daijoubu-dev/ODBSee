@@ -1,4 +1,6 @@
-﻿using Microsoft.Win32;
+﻿using System;
+using System.Globalization;
+using Microsoft.Win32;
 using System.Data.Odbc;
 using System.IO;
 using System.Reflection;
@@ -7,6 +9,7 @@ using System.Windows;
 using System.Windows.Controls;
 using Button = System.Windows.Controls.Button;
 using Label = System.Windows.Controls.Label;
+using MenuItem = System.Windows.Controls.MenuItem;
 using MessageBox = System.Windows.MessageBox;
 using OpenFileDialog = Microsoft.Win32.OpenFileDialog;
 using Orientation = System.Windows.Controls.Orientation;
@@ -19,14 +22,26 @@ namespace ODBSee
     public partial class MainWindow : Window
     {
         private string _selectedDsn = "";
+        
+        // These now act as references to the current tab's state
         private List<string[]> _cachedData = new List<string[]>();
         private List<string> _columnNames = new List<string>();
 
-        // Trackers for sorting
+        // Trackers for sorting (will be updated from/to tab state)
         private int _lastSortColumnIndex = -1;
         private bool _sortAscending = true;
 
-        private OdbcCommand _currentCommand;
+        private OdbcCommand? _currentCommand;
+        private CancellationTokenSource? _currentCts;
+        private Task? _runningQueryTask;
+
+        public class TabState
+        {
+            public List<string[]> CachedData { get; set; } = new List<string[]>();
+            public List<string> ColumnNames { get; set; } = new List<string>();
+            public int LastSortColumnIndex { get; set; } = -1;
+            public bool SortAscending { get; set; } = true;
+        }
 
         public MainWindow()
         {
@@ -81,7 +96,7 @@ namespace ODBSee
                     _lastSortColumnIndex = colIndex;
                 }
 
-                // Perform the sort
+                // Perform the sort and sync back to tab state
                 if (_sortAscending)
                 {
                     _cachedData = _cachedData.OrderBy(x => x[colIndex]).ToList();
@@ -91,8 +106,50 @@ namespace ODBSee
                     _cachedData = _cachedData.OrderByDescending(x => x[colIndex]).ToList();
                 }
 
+                // Sync back to the active tab state so it persists
+                if (QueryTabs.SelectedItem is TabItem currentTab && currentTab.Tag is TabState state)
+                {
+                    state.CachedData = _cachedData;
+                    state.LastSortColumnIndex = _lastSortColumnIndex;
+                    state.SortAscending = _sortAscending;
+                }
+
                 WfGrid.Invalidate();
             };
+        }
+
+        private void QueryTabs_SelectionChanged(object sender, SelectionChangedEventArgs e)
+        {
+            if (QueryTabs.SelectedItem is TabItem currentTab && currentTab.Tag is TabState state)
+            {
+                RefreshGridFromState(state);
+            }
+        }
+
+        private void RefreshGridFromState(TabState state)
+        {
+            // Update global references used by virtual grid and sorting
+            _cachedData = state.CachedData;
+            _columnNames = state.ColumnNames;
+            _lastSortColumnIndex = state.LastSortColumnIndex;
+            _sortAscending = state.SortAscending;
+
+            WfGrid.Columns.Clear();
+            foreach (var colName in _columnNames)
+            {
+                var col = new WinForms.DataGridViewTextBoxColumn
+                {
+                    HeaderText = colName,
+                    Name = colName,
+                    SortMode = WinForms.DataGridViewColumnSortMode.Programmatic
+                };
+                WfGrid.Columns.Add(col);
+            }
+
+            WfGrid.RowCount = _cachedData.Count;
+            StatusRowCount.Text = $"{_cachedData.Count} Rows";
+            
+            WfGrid.Invalidate();
         }
 
         private void BtnExecute_Click(object sender, RoutedEventArgs e)
@@ -102,18 +159,28 @@ namespace ODBSee
 
         private async void ExecuteQuery()
         {
-            if (_currentCommand != null)
+            // Cancel any existing execution
+            if (_currentCts != null)
             {
+                _currentCts.Cancel();
                 try
                 {
-                    _currentCommand.Cancel();
-                    StatusInfo.Text = "Previous query cancelled. Starting new...";
+                    _currentCommand?.Cancel();
                 }
-                catch { /* Ignore cancellation errors */ }
+                catch { /* Ignore */ }
+
+                if (_runningQueryTask != null)
+                {
+                    StatusInfo.Text = "Cancelling previous query...";
+                    try { await _runningQueryTask; } catch { }
+                }
             }
 
+            var activeTab = QueryTabs.SelectedItem as TabItem;
+            var state = activeTab?.Tag as TabState;
             var activeBox = GetCurrentQueryBox();
-            if (activeBox == null || string.IsNullOrEmpty(_selectedDsn)) return;
+
+            if (activeBox == null || state == null || string.IsNullOrEmpty(_selectedDsn)) return;
 
             var queryText = activeBox.Text;
             var userId = TxtUser.Text;
@@ -124,41 +191,85 @@ namespace ODBSee
             StatusInfo.Text = "Executing Query...";
             var connString = $"DSN={_selectedDsn};Uid={userId};Pwd={password};Connect Timeout=300;";
 
+            _currentCts = new CancellationTokenSource();
+            var token = _currentCts.Token;
+
             try
             {
-                var result = await Task.Run(() => FetchData(connString, queryText, maxRows));
-
-                _columnNames = result.Columns;
-                _cachedData = result.Rows;
-
-                // Reset sort trackers for the new result set
-                _lastSortColumnIndex = -1;
-                _sortAscending = true;
-
-                WfGrid.Columns.Clear();
-                foreach (var colName in _columnNames)
+                if (_selectedDsn == "DUMMY")
                 {
-                    // Set SortMode to Programmatic for performance (so the grid doesn't try to handle it internally)
-                    var col = new WinForms.DataGridViewTextBoxColumn
-                    {
-                        HeaderText = colName,
-                        Name = colName,
-                        SortMode = WinForms.DataGridViewColumnSortMode.Programmatic
-                    };
-                    WfGrid.Columns.Add(col);
+                    _runningQueryTask = Task.Run(() => GenerateDummyData(maxRows), token);
+                }
+                else
+                {
+                    _runningQueryTask = Task.Run(() => FetchData(connString, queryText, maxRows), token);
                 }
 
-                WfGrid.RowCount = _cachedData.Count;
+                var (columns, rows) = await (Task<(List<string>, List<string[]>)>)_runningQueryTask;
 
-                StatusRowCount.Text = $"{_cachedData.Count} Rows";
-                StatusConnection.Text = "Connected";
-                StatusInfo.Text = "Ready";
+                state.ColumnNames = columns;
+                state.CachedData = rows;
+                state.LastSortColumnIndex = -1;
+                state.SortAscending = true;
+
+                // Only update the grid if the tab that initiated the query is still the active one
+                if (QueryTabs.SelectedItem == activeTab)
+                {
+                    RefreshGridFromState(state);
+                    StatusConnection.Text = "Connected";
+                    StatusInfo.Text = "Ready";
+                }
+                else
+                {
+                    StatusInfo.Text = $"Background query for '{((Label)((StackPanel)activeTab.Header).Children[0]).Content}' finished.";
+                }
+            }
+            catch (OperationCanceledException)
+            {
+                StatusInfo.Text = "Query Cancelled";
             }
             catch (Exception ex)
             {
-                MessageBox.Show(ex.Message);
-                StatusInfo.Text = "Error";
+                if (!token.IsCancellationRequested)
+                {
+                    MessageBox.Show(ex.Message);
+                    StatusInfo.Text = "Error";
+                }
             }
+            finally
+            {
+                if (_currentCts?.Token == token)
+                {
+                    _currentCts = null;
+                    _runningQueryTask = null;
+                }
+            }
+        }
+
+        private (List<string> Columns, List<string[]> Rows) GenerateDummyData(int maxRows)
+        {
+            var columns = new List<string> { "ID", "Name", "Category", "Value", "Status", "Last Modified" };
+            var rows = new List<string[]>();
+            var rand = new Random();
+            
+            for (int i = 1; i <= maxRows; i++)
+            {
+                if (_currentCts?.IsCancellationRequested == true)
+                    throw new OperationCanceledException();
+
+                rows.Add(new string[] { 
+                    i.ToString(), 
+                    $"Dummy Record {i}", 
+                    rand.Next(0, 2) == 0 ? "Production" : "Staging",
+                    (rand.NextDouble() * 1000).ToString("F2"), 
+                    rand.Next(0, 3) switch { 0 => "Active", 1 => "Pending", _ => "Archived" },
+                    DateTime.Now.AddDays(-rand.Next(1, 30)).ToString("yyyy-MM-dd HH:mm:ss")
+                });
+            }
+
+            // Simulate a slight network delay
+            Thread.Sleep(300);
+            return (columns, rows);
         }
 
         private (List<string> Columns, List<string[]> Rows) FetchData(string connString, string sql, int maxRows)
@@ -176,6 +287,9 @@ namespace ODBSee
             int count = 0;
             while (reader.Read() && count < maxRows)
             {
+                if (_currentCts?.IsCancellationRequested == true)
+                    throw new OperationCanceledException();
+
                 string[] row = new string[reader.FieldCount];
                 for (int i = 0; i < reader.FieldCount; i++)
                     row[i] = reader[i]?.ToString() ?? "";
@@ -188,7 +302,7 @@ namespace ODBSee
 
         public List<string> GetOdbcDataSources()
         {
-            var sources = new List<string>();
+            var sources = new List<string> { "DUMMY" };
             using (var root = Registry.CurrentUser.OpenSubKey(@"Software\ODBC\ODBC.INI\ODBC Data Sources"))
                 if (root != null) foreach (var name in root.GetValueNames()) sources.Add(name);
             using (var root = Registry.LocalMachine.OpenSubKey(@"Software\ODBC\ODBC.INI\ODBC Data Sources"))
@@ -204,7 +318,7 @@ namespace ODBSee
             {
                 var mi = new MenuItem { Header = source };
                 mi.Click += (s, args) => {
-                    _selectedDsn = mi.Header.ToString();
+                    _selectedDsn = mi.Header.ToString() ?? "";
                     BtnDatasource.Content = _selectedDsn;
                     AutoFillDsnDetails(_selectedDsn);
                 };
@@ -215,6 +329,7 @@ namespace ODBSee
 
         private void AutoFillDsnDetails(string dsnName)
         {
+            if (dsnName == "DUMMY") return;
             var path = $@"SOFTWARE\ODBC\ODBC.INI\{dsnName}";
             using var key = Registry.CurrentUser.OpenSubKey(path) ?? Registry.LocalMachine.OpenSubKey(path);
             if (key != null)
@@ -393,7 +508,6 @@ namespace ODBSee
             return null;
         }
 
-        // Logic for the [+] Button
         private void AddNewTab_Click(object sender, RoutedEventArgs e)
         {
             CreateNewTab("New Query", "select * from ");
@@ -425,7 +539,6 @@ namespace ODBSee
                 MinWidth = 40
             };
 
-            // DOUBLE CLICK TO RENAME LOGIC
             titleLabel.MouseDoubleClick += (s, e) =>
             {
                 var editBox = new TextBox { Text = titleLabel.Content.ToString(), MinWidth = 60 };
@@ -459,10 +572,8 @@ namespace ODBSee
                 VerticalAlignment = VerticalAlignment.Center
             };
 
-            // Create the TabItem first so the button can reference it
-            var newTab = new TabItem { Content = newBox };
+            var newTab = new TabItem { Content = newBox, Tag = new TabState() };
 
-            // FIX: Remove 'newTab' specifically, not just the 'SelectedItem'
             closeBtn.Click += (s, e) =>
             {
                 if (QueryTabs.Items.Count > 1)
