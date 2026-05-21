@@ -20,6 +20,8 @@ Remember ODBC connection per tab
 
 Cutsom timeout limit
 
+Save state of all tabs and queries
+
 
 # BUGS
 Executions crash when cancelling/rerunning currently running query
