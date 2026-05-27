@@ -18,12 +18,14 @@ Resizable query text box
 
 Remember ODBC connection per tab
 
-Cutsom timeout limit
+Custom timeout limit
 
 Save state of all tabs and queries
+
+MSI Installer (feels more legitimate)
 
 
 # BUGS
 Executions crash when cancelling/rerunning currently running query
 
-
+Massive pulls can lag and even crash the application. Maybe a local file to manage? 
