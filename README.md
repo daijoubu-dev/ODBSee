@@ -17,5 +17,5 @@ Download (Single File .exe ~155MB): https://github.com/daijoubu-dev/ODBSee/relea
 *   [ ] Optimize standalone executable size (Compression & Trimming)
 
 # BUGS
-*   [x] Executions crash when cancelling/rerunning currently running query (Fixed via UI execute/stop toggle and thread-safe cancellation task encapsulation)
-*   Massive pulls can lag and even crash the application (needs memory-efficient exporting and safety limits)
+*   [ ] Executions crash when cancelling/rerunning currently running query (Fixed via UI execute/stop toggle and thread-safe cancellation task encapsulation)
+*   [ ] Massive pulls can lag and even crash the application (needs memory-efficient exporting and safety limits)
