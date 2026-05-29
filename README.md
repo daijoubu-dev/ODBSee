@@ -4,8 +4,8 @@ A WPF ODBC Client I made because ODBC View has some quirks i would like to fix b
 Download (Single File .exe ~155MB): https://github.com/daijoubu-dev/ODBSee/releases
 
 # TO DO:
-*   32 bit support (WOW6432Node registry probe & x86 build target)
-*   Better distinguishing between User/System/Other DSN
+*   [x] 32 bit support (WOW6432Node registry probe & x86 build target)
+*   [x] Better distinguishing between User/System/Other DSN
 *   [x] "Copy with Headers" UI Checkbox (copies highlighted cells with/without headers based on check state)
 *   [x] Single cell copy (right-click or selection-based copying)
 *   [x] Resizable query text box (GridSplitter integration)
@@ -13,7 +13,8 @@ Download (Single File .exe ~155MB): https://github.com/daijoubu-dev/ODBSee/relea
 *   [x] Save state of all tabs and queries (Auto-saves every 60 seconds; preserves query texts, tab titles, and connections; excludes massive query results to prevent lag)
 *   [x] Clickable status bar showing the last 50 log messages / query execution history
 *   [x] Manual "Check for Updates" Hyperlink (Probes GitHub Releases API asynchronously, handles standalone EXEs & MSIs by opening downloads page if an update is found)
-*   Custom timeout limit (dynamic Connect Timeout and CommandTimeout)
+*   [ ] Custom timeout limit (dynamic Connect Timeout and CommandTimeout)
+*   [ ] Optimize standalone executable size (Compression & Trimming)
 
 # BUGS
 *   [x] Executions crash when cancelling/rerunning currently running query (Fixed via UI execute/stop toggle and thread-safe cancellation task encapsulation)

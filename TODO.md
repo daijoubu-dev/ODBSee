@@ -22,6 +22,13 @@ This document tracks planned features, stability fixes, and bugs for ODBSee, dir
     *   [ ] **Explicit Memory Cleanup:** Ensure references (`_cachedData`, `_columnNames`) are set to null upon closing a tab to prevent memory leaks.
 *   **Target:** `MainWindow.xaml.cs` -> `BtnExport_Click`, `GenerateCsv`, `CreateNewTab`
 
+### 2b. Optimize Standalone Executable Size
+*   **Issue:** The single-file EXE is ~155MB because `SelfContained=true` bundles the entire .NET runtime.
+*   **Plan of Attack:**
+    *   [ ] **Enable Compression:** Add `<EnableCompressionInSingleFile>true</EnableCompressionInSingleFile>` to Release PropertyGroup.
+    *   [ ] **Test Assembly Trimming:** Evaluate `<PublishTrimmed>true</PublishTrimmed>` to prune unused runtime libraries (needs validation with WPF reflection).
+*   **Target:** `ODBSee.csproj`
+
 ---
 
 ## 🛠️ Connection & Compatibility Improvements
