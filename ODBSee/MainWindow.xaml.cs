@@ -1,12 +1,15 @@
-﻿using System;
+using System;
 using System.Globalization;
 using Microsoft.Win32;
 using System.Data.Odbc;
 using System.IO;
+using System.Net.Http;
 using System.Reflection;
 using System.Text;
+using System.Text.Json;
 using System.Windows;
 using System.Windows.Controls;
+using System.Windows.Threading;
 using Button = System.Windows.Controls.Button;
 using Label = System.Windows.Controls.Label;
 using MenuItem = System.Windows.Controls.MenuItem;
@@ -19,6 +22,12 @@ using WinForms = System.Windows.Forms;
 
 namespace ODBSee
 {
+    public class OdbcDsn
+    {
+        public string Name { get; set; } = "";
+        public string SourceType { get; set; } = "";
+    }
+
     public partial class MainWindow : Window
     {
         private string _selectedDsn = "";
@@ -35,12 +44,34 @@ namespace ODBSee
         private CancellationTokenSource? _currentCts;
         private Task? _runningQueryTask;
 
+        // Log history fields (last 50 messages)
+        private readonly List<string> _logHistory = new List<string>();
+        private readonly object _logLock = new object();
+
         public class TabState
         {
             public List<string[]> CachedData { get; set; } = new List<string[]>();
             public List<string> ColumnNames { get; set; } = new List<string>();
             public int LastSortColumnIndex { get; set; } = -1;
             public bool SortAscending { get; set; } = true;
+            public string SelectedDsn { get; set; } = "";
+            public string User { get; set; } = "";
+            public string Password { get; set; } = "";
+        }
+
+        public class SessionState
+        {
+            public List<TabSessionInfo> Tabs { get; set; } = new List<TabSessionInfo>();
+            public int ActiveTabIndex { get; set; } = 0;
+        }
+
+        public class TabSessionInfo
+        {
+            public string Header { get; set; } = "";
+            public string QueryText { get; set; } = "";
+            public string SelectedDsn { get; set; } = "";
+            public string User { get; set; } = "";
+            public string Password { get; set; } = "";
         }
 
         public MainWindow()
@@ -48,8 +79,293 @@ namespace ODBSee
             InitializeComponent();
             SetupWinFormsGrid();
 
+            // Set up hover underline dynamic micro-animation for status bar
+            StatusInfo.MouseEnter += (s, e) => StatusInfo.TextDecorations = TextDecorations.Underline;
+            StatusInfo.MouseLeave += (s, e) => StatusInfo.TextDecorations = null;
+
+            // Register closing handler to save session on exit
+            this.Closing += (s, e) => SaveSession();
+
             QueryTabs.Items.Clear(); // Remove the placeholder from XAML
-            CreateNewTab("Query 1", "select * from ");
+
+            // Load saved session if exists, otherwise create a new default tab
+            if (!LoadSession())
+            {
+                CreateNewTab("Query 1", "select * from ");
+            }
+
+            // Set up auto-save DispatcherTimer (runs every 60 seconds on UI thread)
+            var autosaveTimer = new DispatcherTimer
+            {
+                Interval = TimeSpan.FromSeconds(60)
+            };
+            autosaveTimer.Tick += (s, e) => SaveSession();
+            autosaveTimer.Start();
+
+            LogStatus("Application started. Ready.");
+        }
+
+        private void LogStatus(string message)
+        {
+            var timestamp = DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss.fff");
+            var logLine = $"[{timestamp}] {message}";
+
+            lock (_logLock)
+            {
+                _logHistory.Add(logLine);
+                if (_logHistory.Count > 50)
+                {
+                    _logHistory.RemoveAt(0);
+                }
+            }
+
+            if (!Dispatcher.CheckAccess())
+            {
+                Dispatcher.Invoke(() => StatusInfo.Text = message);
+            }
+            else
+            {
+                StatusInfo.Text = message;
+            }
+        }
+
+        private void SaveSession()
+        {
+            try
+            {
+                // Sync the active tab credentials first
+                if (QueryTabs.SelectedItem is TabItem activeTab && activeTab.Tag is TabState activeState)
+                {
+                    activeState.SelectedDsn = _selectedDsn;
+                    activeState.User = TxtUser.Text;
+                    activeState.Password = TxtPass.Password;
+                }
+
+                var session = new SessionState
+                {
+                    ActiveTabIndex = QueryTabs.SelectedIndex
+                };
+
+                foreach (TabItem tab in QueryTabs.Items)
+                {
+                    if (tab.Tag is TabState state && tab.Content is TextBox tb)
+                    {
+                        string headerText = "Query";
+                        if (tab.Header is StackPanel sp && sp.Children[0] is Label lbl)
+                        {
+                            headerText = lbl.Content?.ToString() ?? "Query";
+                        }
+
+                        session.Tabs.Add(new TabSessionInfo
+                        {
+                            Header = headerText,
+                            QueryText = tb.Text,
+                            SelectedDsn = state.SelectedDsn,
+                            User = state.User,
+                            Password = state.Password
+                        });
+                    }
+                }
+
+                var appDataPath = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "ODBSee");
+                if (!Directory.Exists(appDataPath))
+                {
+                    Directory.CreateDirectory(appDataPath);
+                }
+
+                var filePath = Path.Combine(appDataPath, "session_state.json");
+                var json = JsonSerializer.Serialize(session, new JsonSerializerOptions { WriteIndented = true });
+                File.WriteAllText(filePath, json, Encoding.UTF8);
+            }
+            catch (Exception ex)
+            {
+                LogStatus($"Autosave failed: {ex.Message}");
+            }
+        }
+
+        private bool LoadSession()
+        {
+            try
+            {
+                var appDataPath = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "ODBSee");
+                var filePath = Path.Combine(appDataPath, "session_state.json");
+                if (!File.Exists(filePath)) return false;
+
+                var json = File.ReadAllText(filePath, Encoding.UTF8);
+                var session = JsonSerializer.Deserialize<SessionState>(json);
+                if (session == null || session.Tabs.Count == 0) return false;
+
+                QueryTabs.Items.Clear();
+                foreach (var tabInfo in session.Tabs)
+                {
+                    CreateNewTabInternal(tabInfo.Header, tabInfo.QueryText, new TabState
+                    {
+                        SelectedDsn = tabInfo.SelectedDsn,
+                        User = tabInfo.User,
+                        Password = tabInfo.Password
+                    });
+                }
+
+                int indexToSelect = session.ActiveTabIndex;
+                if (indexToSelect >= 0 && indexToSelect < QueryTabs.Items.Count)
+                {
+                    QueryTabs.SelectedIndex = indexToSelect;
+                }
+                else if (QueryTabs.Items.Count > 0)
+                {
+                    QueryTabs.SelectedIndex = 0;
+                }
+
+                LogStatus($"Restored {session.Tabs.Count} queries from previous session.");
+                return true;
+            }
+            catch (Exception ex)
+            {
+                LogStatus($"Failed to load session state: {ex.Message}");
+                return false;
+            }
+        }
+
+        private void SetQueryRunningState(bool isRunning)
+        {
+            if (isRunning)
+            {
+                BtnExecute.Background = new System.Windows.Media.SolidColorBrush((System.Windows.Media.Color)System.Windows.Media.ColorConverter.ConvertFromString("#D13438"));
+                
+                if (BtnExecute.Content is TextBlock tb)
+                {
+                    tb.Text = "■ Stop";
+                }
+                else
+                {
+                    BtnExecute.Content = new TextBlock { Text = "■ Stop" };
+                }
+            }
+            else
+            {
+                BtnExecute.Background = new System.Windows.Media.SolidColorBrush((System.Windows.Media.Color)System.Windows.Media.ColorConverter.ConvertFromString("#007ACC"));
+                
+                if (BtnExecute.Content is TextBlock tb)
+                {
+                    tb.Text = "▶ Execute";
+                }
+                else
+                {
+                    BtnExecute.Content = new TextBlock { Text = "▶ Execute" };
+                }
+            }
+        }
+
+        private void CancelQuery()
+        {
+            if (_currentCts != null)
+            {
+                LogStatus("Query cancellation requested by user...");
+                try
+                {
+                    _currentCts.Cancel();
+                    _currentCommand?.Cancel();
+                }
+                catch (Exception ex)
+                {
+                    LogStatus($"Error while calling Cancel on command: {ex.Message}");
+                }
+            }
+        }
+
+        private void StatusInfo_MouseLeftButtonUp(object sender, System.Windows.Input.MouseButtonEventArgs e)
+        {
+            var logWindow = new Window
+            {
+                Title = "ODBSee Log History",
+                Width = 650,
+                Height = 450,
+                WindowStartupLocation = WindowStartupLocation.CenterOwner,
+                Owner = this,
+                Background = System.Windows.Media.Brushes.White,
+                ShowInTaskbar = false
+            };
+
+            var grid = new Grid { Margin = new Thickness(12) };
+            grid.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
+            grid.RowDefinitions.Add(new RowDefinition { Height = new GridLength(1, GridUnitType.Star) });
+            grid.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
+
+            var header = new TextBlock
+            {
+                Text = "ODBSee Activity Logs (Last 50 messages)",
+                FontSize = 14,
+                FontWeight = FontWeights.Bold,
+                Margin = new Thickness(0, 0, 0, 10),
+                Foreground = new System.Windows.Media.SolidColorBrush((System.Windows.Media.Color)System.Windows.Media.ColorConverter.ConvertFromString("#333333"))
+            };
+            Grid.SetRow(header, 0);
+            grid.Children.Add(header);
+
+            string logsText;
+            lock (_logLock)
+            {
+                logsText = string.Join(Environment.NewLine, _logHistory);
+            }
+
+            var logBox = new TextBox
+            {
+                Text = string.IsNullOrEmpty(logsText) ? "No log history recorded yet." : logsText,
+                IsReadOnly = true,
+                FontFamily = new System.Windows.Media.FontFamily("Consolas"),
+                FontSize = 11,
+                AcceptsReturn = true,
+                VerticalScrollBarVisibility = ScrollBarVisibility.Auto,
+                HorizontalScrollBarVisibility = ScrollBarVisibility.Auto,
+                Background = new System.Windows.Media.SolidColorBrush((System.Windows.Media.Color)System.Windows.Media.ColorConverter.ConvertFromString("#F8F9FA")),
+                Foreground = new System.Windows.Media.SolidColorBrush((System.Windows.Media.Color)System.Windows.Media.ColorConverter.ConvertFromString("#212529")),
+                Padding = new Thickness(8),
+                BorderBrush = new System.Windows.Media.SolidColorBrush((System.Windows.Media.Color)System.Windows.Media.ColorConverter.ConvertFromString("#CED4DA")),
+                BorderThickness = new Thickness(1)
+            };
+            Grid.SetRow(logBox, 1);
+            grid.Children.Add(logBox);
+
+            var btnPanel = new StackPanel
+            {
+                Orientation = Orientation.Horizontal,
+                HorizontalAlignment = System.Windows.HorizontalAlignment.Right,
+                Margin = new Thickness(0, 12, 0, 0)
+            };
+            Grid.SetRow(btnPanel, 2);
+            grid.Children.Add(btnPanel);
+
+            var copyBtn = new Button
+            {
+                Content = "Copy to Clipboard",
+                Padding = new Thickness(12, 6, 12, 6),
+                Margin = new Thickness(0, 0, 10, 0)
+            };
+            copyBtn.Click += (s2, e2) =>
+            {
+                try
+                {
+                    System.Windows.Clipboard.SetText(logsText);
+                    MessageBox.Show("Logs copied to clipboard!", "Copied", MessageBoxButton.OK, MessageBoxImage.Information);
+                }
+                catch (Exception ex)
+                {
+                    MessageBox.Show($"Failed to copy logs: {ex.Message}", "Error", MessageBoxButton.OK, MessageBoxImage.Error);
+                }
+            };
+            btnPanel.Children.Add(copyBtn);
+
+            var closeBtn = new Button
+            {
+                Content = "Close",
+                Padding = new Thickness(18, 6, 18, 6),
+                IsDefault = true
+            };
+            closeBtn.Click += (s2, e2) => logWindow.Close();
+            btnPanel.Children.Add(closeBtn);
+
+            logWindow.Content = grid;
+            logWindow.ShowDialog();
         }
 
         private void SetupWinFormsGrid()
@@ -57,12 +373,12 @@ namespace ODBSee
             WfGrid.VirtualMode = true;
             WfGrid.ReadOnly = true;
             WfGrid.AllowUserToAddRows = false;
-            WfGrid.RowHeadersVisible = false;
+            WfGrid.RowHeadersVisible = true; // Make row headers visible so users can select entire rows by clicking headers
+            WfGrid.RowHeadersWidth = 40; // Set a nice default width for the row headers
             WfGrid.AllowUserToResizeRows = false;
             WfGrid.AllowUserToResizeColumns = true;
-            WfGrid.ClipboardCopyMode = DataGridViewClipboardCopyMode.Disable; //disable native copy so we can do our own functional copy
-            WfGrid.SelectionMode = DataGridViewSelectionMode.FullRowSelect;
-            WfGrid.ClipboardCopyMode = DataGridViewClipboardCopyMode.EnableAlwaysIncludeHeaderText;
+            WfGrid.ClipboardCopyMode = WinForms.DataGridViewClipboardCopyMode.Disable; //disable native copy so we can do our own functional copy
+            WfGrid.SelectionMode = WinForms.DataGridViewSelectionMode.RowHeaderSelect; // Allows both cell block and row selections!
 
             //listener for manual copy method
             WfGrid.KeyDown += WfGrid_KeyDown;
@@ -120,8 +436,23 @@ namespace ODBSee
 
         private void QueryTabs_SelectionChanged(object sender, SelectionChangedEventArgs e)
         {
+            // 1. Save connection credentials for any tab being deselected
+            if (e.RemovedItems.Count > 0 && e.RemovedItems[0] is TabItem prevTab && prevTab.Tag is TabState prevState)
+            {
+                prevState.SelectedDsn = _selectedDsn;
+                prevState.User = TxtUser.Text;
+                prevState.Password = TxtPass.Password;
+            }
+
+            // 2. Load connection credentials and grid data for the newly selected tab
             if (QueryTabs.SelectedItem is TabItem currentTab && currentTab.Tag is TabState state)
             {
+                // Sync tab credentials back to the connection pane
+                _selectedDsn = state.SelectedDsn;
+                BtnDatasource.Content = string.IsNullOrEmpty(_selectedDsn) ? "Select Datasource..." : _selectedDsn;
+                TxtUser.Text = state.User;
+                TxtPass.Password = state.Password;
+
                 RefreshGridFromState(state);
             }
         }
@@ -162,25 +493,20 @@ namespace ODBSee
             // Cancel any existing execution
             if (_currentCts != null)
             {
-                _currentCts.Cancel();
-                try
-                {
-                    _currentCommand?.Cancel();
-                }
-                catch { /* Ignore */ }
-
-                if (_runningQueryTask != null)
-                {
-                    StatusInfo.Text = "Cancelling previous query...";
-                    try { await _runningQueryTask; } catch { }
-                }
+                CancelQuery();
+                return;
             }
 
             var activeTab = QueryTabs.SelectedItem as TabItem;
             var state = activeTab?.Tag as TabState;
             var activeBox = GetCurrentQueryBox();
 
-            if (activeBox == null || state == null || string.IsNullOrEmpty(_selectedDsn)) return;
+            if (activeBox == null || state == null) return;
+            if (string.IsNullOrEmpty(_selectedDsn))
+            {
+                MessageBox.Show("Please select an ODBC Datasource first.", "Datasource Required", MessageBoxButton.OK, MessageBoxImage.Warning);
+                return;
+            }
 
             var queryText = activeBox.Text;
             var userId = TxtUser.Text;
@@ -188,17 +514,21 @@ namespace ODBSee
             int.TryParse(TxtMaxRows.Text, out var maxRows);
             if (maxRows <= 0) maxRows = 1000;
 
-            StatusInfo.Text = "Executing Query...";
+            LogStatus($"Executing query on DSN '{_selectedDsn}' (Limit: {maxRows} rows)...");
             var connString = $"DSN={_selectedDsn};Uid={userId};Pwd={password};Connect Timeout=300;";
 
             _currentCts = new CancellationTokenSource();
             var token = _currentCts.Token;
 
+            // Set UI executing state
+            SetQueryRunningState(true);
+
             try
             {
-                if (_selectedDsn == "DUMMY")
+                if (_selectedDsn == "DUMMY" || _selectedDsn == "DUMMY_10s")
                 {
-                    _runningQueryTask = Task.Run(() => GenerateDummyData(maxRows), token);
+                    bool isLongDelay = _selectedDsn == "DUMMY_10s";
+                    _runningQueryTask = Task.Run(() => GenerateDummyData(maxRows, isLongDelay), token);
                 }
                 else
                 {
@@ -217,23 +547,39 @@ namespace ODBSee
                 {
                     RefreshGridFromState(state);
                     StatusConnection.Text = "Connected";
-                    StatusInfo.Text = "Ready";
+                    LogStatus($"Query executed successfully: returned {rows.Count} rows.");
                 }
                 else
                 {
-                    StatusInfo.Text = $"Background query for '{((Label)((StackPanel)activeTab.Header).Children[0]).Content}' finished.";
+                    LogStatus($"Background query finished: returned {rows.Count} rows.");
                 }
             }
             catch (OperationCanceledException)
             {
-                StatusInfo.Text = "Query Cancelled";
+                LogStatus("Query execution cancelled by user.");
+            }
+            catch (OdbcException ex)
+            {
+                if (token.IsCancellationRequested)
+                {
+                    LogStatus("Query cancelled by user (OdbcException handled).");
+                }
+                else
+                {
+                    LogStatus($"ODBC Error: {ex.Message}");
+                    MessageBox.Show(ex.Message, "ODBC Database Error", MessageBoxButton.OK, MessageBoxImage.Error);
+                }
             }
             catch (Exception ex)
             {
-                if (!token.IsCancellationRequested)
+                if (token.IsCancellationRequested)
                 {
-                    MessageBox.Show(ex.Message);
-                    StatusInfo.Text = "Error";
+                    LogStatus("Query cancelled by user (Exception handled).");
+                }
+                else
+                {
+                    LogStatus($"Query Error: {ex.Message}");
+                    MessageBox.Show(ex.Message, "Query Execution Error", MessageBoxButton.OK, MessageBoxImage.Error);
                 }
             }
             finally
@@ -243,15 +589,30 @@ namespace ODBSee
                     _currentCts = null;
                     _runningQueryTask = null;
                 }
+                SetQueryRunningState(false);
             }
         }
 
-        private (List<string> Columns, List<string[]> Rows) GenerateDummyData(int maxRows)
+        private (List<string> Columns, List<string[]> Rows) GenerateDummyData(int maxRows, bool isLongDelay)
         {
             var columns = new List<string> { "ID", "Name", "Category", "Value", "Status", "Last Modified" };
             var rows = new List<string[]>();
             var rand = new Random();
             
+            // Loop and sleep in 100ms chunks to ensure rapid responsiveness to stop/cancellation commands
+            int totalSleepMs = isLongDelay ? 10000 : 300;
+            int intervalMs = 100;
+            int elapsedMs = 0;
+            
+            while (elapsedMs < totalSleepMs)
+            {
+                if (_currentCts?.IsCancellationRequested == true)
+                    throw new OperationCanceledException();
+                
+                Thread.Sleep(intervalMs);
+                elapsedMs += intervalMs;
+            }
+
             for (int i = 1; i <= maxRows; i++)
             {
                 if (_currentCts?.IsCancellationRequested == true)
@@ -267,8 +628,6 @@ namespace ODBSee
                 });
             }
 
-            // Simulate a slight network delay
-            Thread.Sleep(300);
             return (columns, rows);
         }
 
@@ -300,13 +659,71 @@ namespace ODBSee
             return (cols, rows);
         }
 
-        public List<string> GetOdbcDataSources()
+        public List<OdbcDsn> GetOdbcDataSources()
         {
-            var sources = new List<string> { "DUMMY" };
-            using (var root = Registry.CurrentUser.OpenSubKey(@"Software\ODBC\ODBC.INI\ODBC Data Sources"))
-                if (root != null) foreach (var name in root.GetValueNames()) sources.Add(name);
-            using (var root = Registry.LocalMachine.OpenSubKey(@"Software\ODBC\ODBC.INI\ODBC Data Sources"))
-                if (root != null) foreach (var name in root.GetValueNames()) sources.Add(name);
+            var sources = new List<OdbcDsn>
+            {
+                new OdbcDsn { Name = "DUMMY", SourceType = "Simulation" },
+                new OdbcDsn { Name = "DUMMY_10s", SourceType = "Simulation" }
+            };
+
+            // 1. Scan User DSNs (shared registry view)
+            try
+            {
+                using var userRoot = RegistryKey.OpenBaseKey(RegistryHive.CurrentUser, RegistryView.Default)
+                    .OpenSubKey(@"Software\ODBC\ODBC.INI\ODBC Data Sources");
+                if (userRoot != null)
+                {
+                    foreach (var name in userRoot.GetValueNames())
+                    {
+                        if (!sources.Any(s => s.Name.Equals(name, StringComparison.OrdinalIgnoreCase)))
+                        {
+                            sources.Add(new OdbcDsn { Name = name, SourceType = "User DSN" });
+                        }
+                    }
+                }
+            }
+            catch { /* Ignore registry read errors */ }
+
+            // 2. Scan System DSNs (64-bit registry view)
+            try
+            {
+                using var sysRoot64 = RegistryKey.OpenBaseKey(RegistryHive.LocalMachine, RegistryView.Registry64)
+                    .OpenSubKey(@"Software\ODBC\ODBC.INI\ODBC Data Sources");
+                if (sysRoot64 != null)
+                {
+                    foreach (var name in sysRoot64.GetValueNames())
+                    {
+                        if (!sources.Any(s => s.Name.Equals(name, StringComparison.OrdinalIgnoreCase)))
+                        {
+                            sources.Add(new OdbcDsn { Name = name, SourceType = "System DSN (64-bit)" });
+                        }
+                    }
+                }
+            }
+            catch { /* Ignore registry read errors */ }
+
+            // 3. Scan System DSNs (32-bit registry view under WOW64)
+            try
+            {
+                if (Environment.Is64BitOperatingSystem)
+                {
+                    using var sysRoot32 = RegistryKey.OpenBaseKey(RegistryHive.LocalMachine, RegistryView.Registry32)
+                        .OpenSubKey(@"Software\ODBC\ODBC.INI\ODBC Data Sources");
+                    if (sysRoot32 != null)
+                    {
+                        foreach (var name in sysRoot32.GetValueNames())
+                        {
+                            if (!sources.Any(s => s.Name.Equals(name, StringComparison.OrdinalIgnoreCase)))
+                            {
+                                sources.Add(new OdbcDsn { Name = name, SourceType = "System DSN (32-bit)" });
+                            }
+                        }
+                    }
+                }
+            }
+            catch { /* Ignore registry read errors */ }
+
             return sources;
         }
 
@@ -314,29 +731,91 @@ namespace ODBSee
         {
             var sources = GetOdbcDataSources();
             DsnMenu.Items.Clear();
-            foreach (var source in sources)
+
+            // Group sources by SourceType
+            var groups = sources.GroupBy(s => s.SourceType).ToList();
+
+            foreach (var group in groups)
             {
-                var mi = new MenuItem { Header = source };
-                mi.Click += (s, args) => {
-                    _selectedDsn = mi.Header.ToString() ?? "";
-                    BtnDatasource.Content = _selectedDsn;
-                    AutoFillDsnDetails(_selectedDsn);
+                var groupMenu = new MenuItem
+                {
+                    Header = group.Key,
+                    FontWeight = FontWeights.Bold
                 };
-                DsnMenu.Items.Add(mi);
+
+                foreach (var source in group)
+                {
+                    var mi = new MenuItem { Header = source.Name };
+                    mi.Click += (s2, args) => {
+                        _selectedDsn = mi.Header.ToString() ?? "";
+                        BtnDatasource.Content = _selectedDsn;
+                        AutoFillDsnDetails(_selectedDsn);
+                    };
+                    groupMenu.Items.Add(mi);
+                }
+
+                DsnMenu.Items.Add(groupMenu);
             }
+
             DsnMenu.IsOpen = true;
         }
 
         private void AutoFillDsnDetails(string dsnName)
         {
-            if (dsnName == "DUMMY") return;
+            if (dsnName == "DUMMY" || dsnName == "DUMMY_10s") return;
+            
             var path = $@"SOFTWARE\ODBC\ODBC.INI\{dsnName}";
-            using var key = Registry.CurrentUser.OpenSubKey(path) ?? Registry.LocalMachine.OpenSubKey(path);
-            if (key != null)
+
+            // Check HKEY_CURRENT_USER first
+            try
             {
-                var user = key.GetValue("LogonID");
-                if (user != null) TxtUser.Text = user.ToString();
+                using var key = RegistryKey.OpenBaseKey(RegistryHive.CurrentUser, RegistryView.Default).OpenSubKey(path);
+                if (key != null)
+                {
+                    var user = key.GetValue("LogonID");
+                    if (user != null)
+                    {
+                        TxtUser.Text = user.ToString();
+                        return;
+                    }
+                }
             }
+            catch { }
+
+            // Check HKEY_LOCAL_MACHINE (64-bit view)
+            try
+            {
+                using var key = RegistryKey.OpenBaseKey(RegistryHive.LocalMachine, RegistryView.Registry64).OpenSubKey(path);
+                if (key != null)
+                {
+                    var user = key.GetValue("LogonID");
+                    if (user != null)
+                    {
+                        TxtUser.Text = user.ToString();
+                        return;
+                    }
+                }
+            }
+            catch { }
+
+            // Check HKEY_LOCAL_MACHINE (32-bit view)
+            try
+            {
+                if (Environment.Is64BitOperatingSystem)
+                {
+                    using var key = RegistryKey.OpenBaseKey(RegistryHive.LocalMachine, RegistryView.Registry32).OpenSubKey(path);
+                    if (key != null)
+                    {
+                        var user = key.GetValue("LogonID");
+                        if (user != null)
+                        {
+                            TxtUser.Text = user.ToString();
+                            return;
+                        }
+                    }
+                }
+            }
+            catch { }
         }
 
         private void TxtQuery_KeyDown(object sender, System.Windows.Input.KeyEventArgs e)
@@ -364,7 +843,7 @@ namespace ODBSee
                 {
                     var fileContent = File.ReadAllText(openFileDialog.FileName);
                     CreateNewTab(Path.GetFileName(openFileDialog.FileName), fileContent);
-                    StatusInfo.Text = $"Loaded: {Path.GetFileName(openFileDialog.FileName)}";
+                    LogStatus($"Loaded query file: {Path.GetFileName(openFileDialog.FileName)}");
                 }
                 catch (Exception ex)
                 {
@@ -397,7 +876,7 @@ namespace ODBSee
                 try
                 {
                     File.WriteAllText(saveFileDialog.FileName, activeBox.Text);
-                    StatusInfo.Text = $"Saved: {Path.GetFileName(saveFileDialog.FileName)}";
+                    LogStatus($"Saved query file: {Path.GetFileName(saveFileDialog.FileName)}");
 
                     if (QueryTabs.SelectedItem is TabItem currentTab && currentTab.Header is StackPanel sp)
                     {
@@ -419,12 +898,12 @@ namespace ODBSee
             var sfd = new SaveFileDialog { Filter = "CSV files (*.csv)|*.csv", FileName = "export.csv" };
             if (sfd.ShowDialog() == true)
             {
-                StatusInfo.Text = "Exporting...";
+                LogStatus("Exporting data to CSV...");
                 
                 var csv = await Task.Run(() => GenerateCsv(_cachedData, _columnNames));
 
                 File.WriteAllText(sfd.FileName, csv, Encoding.UTF8);
-                StatusInfo.Text = $"Exported {Path.GetFileName(sfd.FileName)}";
+                LogStatus($"Exported result set successfully to {Path.GetFileName(sfd.FileName)}");
             }
         }
 
@@ -452,18 +931,46 @@ namespace ODBSee
 
         private void CopySelectedToCsv()
         {
-            if (WfGrid.SelectedRows.Count == 0) return;
+            if (WfGrid.SelectedCells.Count == 0) return;
 
-            var selectedData = WfGrid.SelectedRows.Cast<WinForms.DataGridViewRow>()
-                .OrderBy(r => r.Index)
-                .Select(r => _cachedData[r.Index]);
+            // Group selected cells by RowIndex to format as rows
+            var cellsByRow = WfGrid.SelectedCells.Cast<WinForms.DataGridViewCell>()
+                .GroupBy(c => c.RowIndex)
+                .OrderBy(g => g.Key)
+                .ToList();
 
-            var csv = GenerateCsv(selectedData);
+            var csvRows = new List<string>();
+
+            // Check if "Copy with Headers" is checked in WPF CheckBox
+            bool includeHeaders = ChkCopyWithHeaders.IsChecked == true;
+
+            if (includeHeaders)
+            {
+                // Find all unique selected column indices, sorted
+                var selectedColIndices = WfGrid.SelectedCells.Cast<WinForms.DataGridViewCell>()
+                    .Select(c => c.ColumnIndex)
+                    .Distinct()
+                    .OrderBy(c => c)
+                    .ToList();
+
+                var headerRow = selectedColIndices.Select(colIndex => colIndex < _columnNames.Count ? _columnNames[colIndex] : $"Col{colIndex}");
+                csvRows.Add(string.Join(",", headerRow.Select(EscapeCsvField)));
+            }
+
+            foreach (var rowGroup in cellsByRow)
+            {
+                // Order cells in this row by ColumnIndex
+                var orderedCells = rowGroup.OrderBy(c => c.ColumnIndex).ToList();
+                var rowData = orderedCells.Select(c => c.Value?.ToString() ?? "");
+                csvRows.Add(string.Join(",", rowData.Select(EscapeCsvField)));
+            }
+
+            var csv = string.Join(Environment.NewLine, csvRows);
 
             if (!string.IsNullOrEmpty(csv))
             {
                 System.Windows.Clipboard.SetText(csv);
-                StatusInfo.Text = "Copied selected rows to clipboard";
+                LogStatus($"Copied {WfGrid.SelectedCells.Count} selected cells to clipboard.");
             }
         }
 
@@ -514,6 +1021,17 @@ namespace ODBSee
         }
 
         private void CreateNewTab(string header, string content)
+        {
+            var initialTabState = new TabState
+            {
+                SelectedDsn = _selectedDsn,
+                User = TxtUser.Text,
+                Password = TxtPass.Password
+            };
+            CreateNewTabInternal(header, content, initialTabState);
+        }
+
+        private void CreateNewTabInternal(string header, string content, TabState state)
         {
             var newBox = new TextBox
             {
@@ -572,7 +1090,7 @@ namespace ODBSee
                 VerticalAlignment = VerticalAlignment.Center
             };
 
-            var newTab = new TabItem { Content = newBox, Tag = new TabState() };
+            var newTab = new TabItem { Content = newBox, Tag = state };
 
             closeBtn.Click += (s, e) =>
             {
@@ -586,6 +1104,88 @@ namespace ODBSee
 
             QueryTabs.Items.Add(newTab);
             QueryTabs.SelectedItem = newTab;
+        }
+
+        private async void BtnCheckUpdate_MouseLeftButtonUp(object sender, System.Windows.Input.MouseButtonEventArgs e)
+        {
+            LogStatus("Checking for updates on GitHub...");
+            BtnCheckUpdate.Text = "Checking...";
+            BtnCheckUpdate.Foreground = System.Windows.Media.Brushes.Gray;
+
+            try
+            {
+                using var client = new HttpClient();
+                // GitHub API requires a User-Agent header
+                client.DefaultRequestHeaders.UserAgent.ParseAdd("ODBSee-Updater");
+
+                var url = "https://api.github.com/repos/daijoubu-dev/ODBSee/releases/latest";
+                var response = await client.GetStringAsync(url);
+
+                using var doc = JsonDocument.Parse(response);
+                var root = doc.RootElement;
+
+                if (root.TryGetProperty("tag_name", out var tagProperty) &&
+                    root.TryGetProperty("html_url", out var urlProperty))
+                {
+                    var latestTag = tagProperty.GetString() ?? "";
+                    var htmlUrl = urlProperty.GetString() ?? "https://github.com/daijoubu-dev/ODBSee/releases";
+
+                    var cleanTag = latestTag.TrimStart('v', 'V');
+                    if (Version.TryParse(cleanTag, out var latestVersion))
+                    {
+                        var currentVersion = Assembly.GetExecutingAssembly().GetName().Version ?? new Version(1, 0, 0, 0);
+
+                        if (latestVersion > currentVersion)
+                        {
+                            LogStatus($"New version available: {latestTag}!");
+                            BtnCheckUpdate.Text = $"Update Available! ({latestTag})";
+                            BtnCheckUpdate.Foreground = new System.Windows.Media.SolidColorBrush((System.Windows.Media.Color)System.Windows.Media.ColorConverter.ConvertFromString("#D13438"));
+                            BtnCheckUpdate.ToolTip = "Click to open GitHub download page";
+
+                            // Re-bind click event to open URL
+                            BtnCheckUpdate.MouseLeftButtonUp -= BtnCheckUpdate_MouseLeftButtonUp;
+                            BtnCheckUpdate.MouseLeftButtonUp += (s2, e2) =>
+                            {
+                                try
+                                {
+                                    System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo
+                                    {
+                                        FileName = htmlUrl,
+                                        UseShellExecute = true
+                                    });
+                                }
+                                catch (Exception ex)
+                                {
+                                    MessageBox.Show($"Could not open release URL: {ex.Message}", "Error", MessageBoxButton.OK, MessageBoxImage.Error);
+                                }
+                            };
+                        }
+                        else
+                        {
+                            LogStatus($"ODBSee is up to date (Version {currentVersion.ToString(3)}).");
+                            BtnCheckUpdate.Text = "Up to Date";
+                            BtnCheckUpdate.Foreground = new System.Windows.Media.SolidColorBrush((System.Windows.Media.Color)System.Windows.Media.ColorConverter.ConvertFromString("#228B22"));
+                            BtnCheckUpdate.ToolTip = "You are running the latest version";
+                        }
+                    }
+                    else
+                    {
+                        throw new Exception("Could not parse latest version tag.");
+                    }
+                }
+                else
+                {
+                    throw new Exception("Latest release tag not found in response.");
+                }
+            }
+            catch (Exception ex)
+            {
+                LogStatus($"Update check failed: {ex.Message}");
+                BtnCheckUpdate.Text = "Check for Updates";
+                BtnCheckUpdate.Foreground = new System.Windows.Media.SolidColorBrush((System.Windows.Media.Color)System.Windows.Media.ColorConverter.ConvertFromString("#007ACC"));
+                BtnCheckUpdate.ToolTip = "Click to check for updates on GitHub";
+                MessageBox.Show($"Update check failed: {ex.Message}{Environment.NewLine}Please check your internet connection.", "Update Check Failed", MessageBoxButton.OK, MessageBoxImage.Warning);
+            }
         }
     }
 }

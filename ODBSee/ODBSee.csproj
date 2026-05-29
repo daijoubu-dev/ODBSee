@@ -19,7 +19,10 @@
 
     <DebugType>none</DebugType>
     <DebugSymbols>false</DebugSymbols>
-
+	  
+	  <!--UPDATE THIS WHEN UPDATING .EXE RELEASE!!!-->
+	<Version>1.2.0</Version>
+	  
   </PropertyGroup>
 
   <ItemGroup>
