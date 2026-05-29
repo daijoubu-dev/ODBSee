@@ -102,6 +102,13 @@ namespace ODBSee
             autosaveTimer.Tick += (s, e) => SaveSession();
             autosaveTimer.Start();
 
+            // Set window title with version
+            var version = Assembly.GetExecutingAssembly().GetName().Version;
+            if (version != null)
+            {
+                this.Title = $"ODBSee v{version.ToString(3)}";
+            }
+
             LogStatus("Application started. Ready.");
         }
 

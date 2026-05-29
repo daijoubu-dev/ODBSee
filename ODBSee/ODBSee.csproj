@@ -21,7 +21,7 @@
     <DebugSymbols>false</DebugSymbols>
 	  
 	  <!--UPDATE THIS WHEN UPDATING .EXE RELEASE!!!-->
-	<Version>1.2.0</Version>
+	<Version>1.2.2</Version>
 	  
   </PropertyGroup>
 
