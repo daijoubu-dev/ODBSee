@@ -1,0 +1,64 @@
+<Window x:Class="ODBSee.SettingsWindow"
+        xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        Title="ODBSee Settings" Width="780" MinWidth="600" SizeToContent="Height"
+        ResizeMode="CanMinimize" WindowStartupLocation="CenterOwner" ShowInTaskbar="False"
+        TextOptions.TextFormattingMode="Display"
+        Background="{DynamicResource Brush.Panel}" Foreground="{DynamicResource Brush.Text}">
+    <StackPanel Margin="20,16,20,16">
+        <TextBlock Text="Appearance" FontWeight="Bold" Margin="0,0,0,6"/>
+        <StackPanel Orientation="Horizontal" Margin="0,2,0,14">
+            <RadioButton x:Name="RbThemeLight" Content="Light" GroupName="Theme" Margin="0,0,24,0"/>
+            <RadioButton x:Name="RbThemeDark" Content="Dark" GroupName="Theme" Margin="0,0,24,0"/>
+            <RadioButton x:Name="RbThemeSystem" Content="Match Windows" GroupName="Theme"/>
+        </StackPanel>
+
+        <TextBlock Text="Connection" FontWeight="Bold" Margin="0,0,0,6"/>
+        <Grid Margin="0,0,0,14">
+            <Grid.ColumnDefinitions>
+                <ColumnDefinition Width="*"/>
+                <ColumnDefinition Width="120"/>
+            </Grid.ColumnDefinitions>
+            <Grid.RowDefinitions>
+                <RowDefinition/>
+                <RowDefinition/>
+                <RowDefinition/>
+            </Grid.RowDefinitions>
+            <TextBlock Text="Connect timeout (seconds)" VerticalAlignment="Center"/>
+            <TextBox x:Name="TxtConnectTimeout" Grid.Column="1" Padding="3" Margin="0,2" HorizontalContentAlignment="Center"/>
+            <TextBlock Grid.Row="1" Text="Query timeout (seconds)" VerticalAlignment="Center"/>
+            <TextBox x:Name="TxtCommandTimeout" Grid.Row="1" Grid.Column="1" Padding="3" Margin="0,2" HorizontalContentAlignment="Center"/>
+            <TextBlock Grid.Row="2" Grid.ColumnSpan="2" Text="0 = no limit. Applies to the next query you run." FontSize="11" Foreground="{DynamicResource Brush.Subtle}" Margin="0,2,0,0"/>
+        </Grid>
+
+        <TextBlock Text="Defaults" FontWeight="Bold" Margin="0,0,0,6"/>
+        <Grid Margin="0,0,0,6">
+            <Grid.ColumnDefinitions>
+                <ColumnDefinition Width="*"/>
+                <ColumnDefinition Width="120"/>
+            </Grid.ColumnDefinitions>
+            <TextBlock Text="Default max rows (new launches)" VerticalAlignment="Center"/>
+            <TextBox x:Name="TxtDefaultMaxRows" Grid.Column="1" Padding="3" Margin="0,2" HorizontalContentAlignment="Center"/>
+        </Grid>
+        <CheckBox x:Name="ChkCopyWithHeaders" Content="Copy with Headers checked by default" Margin="0,2,0,14"/>
+
+        <TextBlock Text="Privacy" FontWeight="Bold" Margin="0,0,0,6"/>
+        <CheckBox x:Name="ChkRememberPasswords" Content="Remember passwords between sessions" Margin="0,2"/>
+        <TextBlock Text="Saved passwords are encrypted with your Windows account (DPAPI) and can't be read by other users or on other machines."
+                   TextWrapping="Wrap" FontSize="11" Foreground="{DynamicResource Brush.Subtle}" Margin="0,2,0,14"/>
+
+        <TextBlock Text="Feedback" FontWeight="Bold" Margin="0,0,0,6"/>
+        <TextBlock Text="GitHub token (optional)" Margin="0,0,0,2"/>
+        <PasswordBox x:Name="TxtGitHubToken" Padding="3"/>
+        <TextBlock TextWrapping="Wrap" FontSize="11" Foreground="{DynamicResource Brush.Subtle}" Margin="0,4,0,16">
+            With a token, Send Feedback files the issue directly. Without one, it opens the GitHub issue page in your browser instead.
+            Use a fine-grained token limited to the ODBSee repo with only "Issues: Read and write". Stored encrypted.
+        </TextBlock>
+
+        <DockPanel LastChildFill="False">
+            <Button DockPanel.Dock="Left" Content="Open data folder" Padding="12,5" Click="BtnOpenFolder_Click" ToolTip="Session, settings and logs (crash.log, activity.log) live here"/>
+            <Button DockPanel.Dock="Right" Content="Cancel" Padding="18,5" MinWidth="80" IsCancel="True"/>
+            <Button DockPanel.Dock="Right" Content="Save" Padding="18,5" MinWidth="80" Margin="0,0,8,0" IsDefault="True" Click="BtnSave_Click"/>
+        </DockPanel>
+    </StackPanel>
+</Window>

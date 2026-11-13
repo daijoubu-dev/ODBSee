@@ -7,11 +7,12 @@
         mc:Ignorable="d"
         Title="ODBSee" Height="600" Width="1000" MinWidth="400"
         TextOptions.TextFormattingMode="Display"
+        Background="{DynamicResource Brush.Window}" Foreground="{DynamicResource Brush.Text}"
         xmlns:wf="clr-namespace:System.Windows.Forms;assembly=System.Windows.Forms"
         xmlns:wfi="clr-namespace:System.Windows.Forms.Integration;assembly=WindowsFormsIntegration">
 
 
-    <Grid Background="#F5F5F5">
+    <Grid Background="{DynamicResource Brush.Window}">
         <Grid.RowDefinitions>
             <RowDefinition Height="150" MinHeight="100"/>
             <RowDefinition Height="Auto"/>
@@ -25,11 +26,11 @@
             <ColumnDefinition Width="180"/>
         </Grid.ColumnDefinitions>
 
-        <Border Grid.Row="0" Grid.Column="0" Padding="15,10" Background="White" BorderBrush="#DDD" BorderThickness="0,0,1,1">
+        <Border Grid.Row="0" Grid.Column="0" Padding="15,10" Background="{DynamicResource Brush.Panel}" BorderBrush="{DynamicResource Brush.Border}" BorderThickness="0,0,1,1">
             <StackPanel>
-                <Button x:Name="BtnDatasource" 
-                    Content="Select Datasource..." 
-                    Padding="5,4" 
+                <Button x:Name="BtnDatasource"
+                    Content="Select Datasource..."
+                    Padding="5,4"
                     Margin="0,0,0,10"
                     Click="BtnDatasource_Click">
                     <Button.ContextMenu>
@@ -37,26 +38,26 @@
                     </Button.ContextMenu>
                 </Button>
 
-                <TextBlock Text="User" FontSize="11" Foreground="#666" Margin="0,0,0,2"/>
+                <TextBlock Text="User" FontSize="11" Foreground="{DynamicResource Brush.Muted}" Margin="0,0,0,2"/>
                 <TextBox x:Name="TxtUser" Margin="0,0,0,8" Padding="3"/>
 
-                <TextBlock Text="Password" FontSize="11" Foreground="#666" Margin="0,0,0,2"/>
+                <TextBlock Text="Password" FontSize="11" Foreground="{DynamicResource Brush.Muted}" Margin="0,0,0,2"/>
                 <PasswordBox x:Name="TxtPass" Padding="3"/>
             </StackPanel>
         </Border>
 
-        <Border Grid.Row="0" Grid.Column="1" Background="White" BorderBrush="#DDD" BorderThickness="0,0,0,1">
+        <Border Grid.Row="0" Grid.Column="1" Background="{DynamicResource Brush.Panel}" BorderBrush="{DynamicResource Brush.Border}" BorderThickness="0,0,0,1">
             <Grid Margin="0,0,0,10">
-                <TabControl x:Name="QueryTabs" BorderThickness="1" Background="White" SelectionChanged="QueryTabs_SelectionChanged" />
+                <TabControl x:Name="QueryTabs" BorderThickness="1" Background="{DynamicResource Brush.Panel}" SelectionChanged="QueryTabs_SelectionChanged" />
 
-                <Button Content="+" 
-                    HorizontalAlignment="Right" 
+                <Button Content="+"
+                    HorizontalAlignment="Right"
                     VerticalAlignment="Top"
-                    Width="50" Height="18" 
+                    Width="50" Height="18"
                     Margin="0,2,5,0"
-                    Click="AddNewTab_Click" 
+                    Click="AddNewTab_Click"
                     ToolTip="New Tab"
-                    Background="#EEE" BorderBrush="#CCC"
+                    Background="{DynamicResource Brush.Button}" BorderBrush="{DynamicResource Brush.BorderStrong}"
                     Panel.ZIndex="1"
                     Padding="0"
                     VerticalContentAlignment="Center"
@@ -66,7 +67,7 @@
             </Grid>
         </Border>
 
-        <Border Grid.Row="0" Grid.Column="2" Padding="15,10" Background="White" BorderBrush="#DDD" BorderThickness="1,0,0,1">
+        <Border Grid.Row="0" Grid.Column="2" Padding="15,10" Background="{DynamicResource Brush.Panel}" BorderBrush="{DynamicResource Brush.Border}" BorderThickness="1,0,0,1">
             <StackPanel>
                 <UniformGrid Columns="2" Margin="0,0,0,10">
                     <Button x:Name="BtnOpen" Content="Open" Click="BtnOpen_Click" Margin="0,0,2,0" Padding="5,3"/>
@@ -78,35 +79,43 @@
                     <TextBox x:Name="TxtMaxRows" Text="1000" Padding="3" HorizontalContentAlignment="Center"/>
                 </DockPanel>
 
-                <Button x:Name="BtnExecute" 
-                    Background="#007ACC" 
-                    Foreground="White" 
+                <Button x:Name="BtnExecute"
+                    Background="#007ACC"
+                    Foreground="White"
                     BorderThickness="0"
-                    FontWeight="Bold" 
+                    FontWeight="Bold"
                     Padding="5,8"
                     Click="BtnExecute_Click"
-                    ToolTip="Ctrl+Enter while typing also works :)">
+                    ToolTip="Ctrl+Enter or F5 runs the query from anywhere :)">
                     <TextBlock Text="▶ Execute" />
                 </Button>
             </StackPanel>
         </Border>
 
-        <GridSplitter Grid.Row="1" Grid.ColumnSpan="3" Height="5" HorizontalAlignment="Stretch" VerticalAlignment="Center" Background="#DDD" ResizeBehavior="PreviousAndNext"/>
+        <GridSplitter Grid.Row="1" Grid.ColumnSpan="3" Height="5" HorizontalAlignment="Stretch" VerticalAlignment="Center" Background="{DynamicResource Brush.Border}" ResizeBehavior="PreviousAndNext"/>
 
         <!--Using winforms here because it runs infinitely better-->
-        <Grid Grid.Row="2" Grid.ColumnSpan="3" Background="White">
+        <Grid Grid.Row="2" Grid.ColumnSpan="3" Background="{DynamicResource Brush.Panel}">
             <wfi:WindowsFormsHost x:Name="Host">
                 <wf:DataGridView x:Name="WfGrid" />
             </wfi:WindowsFormsHost>
         </Grid>
 
-        <StatusBar Grid.Row="3" Grid.ColumnSpan="3" Background="#EEE" BorderThickness="0,1,0,0" BorderBrush="#CCC">
+        <StatusBar Grid.Row="3" Grid.ColumnSpan="3" Background="{DynamicResource Brush.StatusBar}" Foreground="{DynamicResource Brush.Text}" BorderThickness="0,1,0,0" BorderBrush="{DynamicResource Brush.BorderStrong}">
             <StatusBarItem Margin="5,0">
-                <TextBlock x:Name="StatusConnection" Text="Disconnected" Foreground="#888"/>
+                <TextBlock x:Name="StatusConnection" Text="Disconnected" Foreground="{DynamicResource Brush.Subtle}"/>
             </StatusBarItem>
             <Separator/>
             <StatusBarItem>
-                <TextBlock x:Name="BtnCheckUpdate" Text="Check for Updates" Cursor="Hand" Foreground="#007ACC" ToolTip="Click to check for updates on GitHub" MouseLeftButtonUp="BtnCheckUpdate_MouseLeftButtonUp" FontWeight="SemiBold"/>
+                <TextBlock x:Name="BtnCheckUpdate" Text="Check for Updates" Cursor="Hand" Foreground="{DynamicResource Brush.Link}" ToolTip="Click to check for updates on GitHub" MouseLeftButtonUp="BtnCheckUpdate_MouseLeftButtonUp" FontWeight="SemiBold"/>
+            </StatusBarItem>
+            <Separator/>
+            <StatusBarItem>
+                <TextBlock x:Name="BtnFeedback" Text="Report Bug / Feedback" Cursor="Hand" Foreground="{DynamicResource Brush.Link}" ToolTip="Send a bug report or idea to GitHub" MouseLeftButtonUp="BtnFeedback_MouseLeftButtonUp" FontWeight="SemiBold"/>
+            </StatusBarItem>
+            <Separator/>
+            <StatusBarItem>
+                <TextBlock x:Name="BtnSettings" Text="Settings" Cursor="Hand" Foreground="{DynamicResource Brush.Link}" ToolTip="Theme, timeouts, defaults, password and feedback options" MouseLeftButtonUp="BtnSettings_MouseLeftButtonUp" FontWeight="SemiBold"/>
             </StatusBarItem>
             <Separator/>
             <StatusBarItem>

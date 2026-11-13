@@ -7,10 +7,14 @@ using System.Net.Http;
 using System.Reflection;
 using System.Text;
 using System.Text.Json;
+using System.Text.Json.Serialization;
 using System.Windows;
 using System.Windows.Controls;
+using System.Windows.Input;
 using System.Windows.Threading;
 using Button = System.Windows.Controls.Button;
+using ContextMenu = System.Windows.Controls.ContextMenu;
+using KeyEventArgs = System.Windows.Input.KeyEventArgs;
 using Label = System.Windows.Controls.Label;
 using MenuItem = System.Windows.Controls.MenuItem;
 using MessageBox = System.Windows.MessageBox;
@@ -31,18 +35,31 @@ namespace ODBSee
     public partial class MainWindow : Window
     {
         private string _selectedDsn = "";
-        
-        // These now act as references to the current tab's state
+
+        private readonly AppSettings _settings = AppSettings.Load();
+
+        // These act as references to the current tab's state
         private List<string[]> _cachedData = new List<string[]>();
         private List<string> _columnNames = new List<string>();
 
         // Trackers for sorting (will be updated from/to tab state)
         private int _lastSortColumnIndex = -1;
         private bool _sortAscending = true;
+        private bool _isSorting;
 
-        private OdbcCommand? _currentCommand;
+        // Query execution. Only one query runs at a time.
         private CancellationTokenSource? _currentCts;
-        private Task? _runningQueryTask;
+        private OdbcCommand? _currentCommand;           // guarded by _commandLock
+        private bool _inExecuteReader;                  // guarded by _commandLock
+        private readonly object _commandLock = new object();
+
+        // Recently closed tabs (most recent first), reopened with Ctrl+Shift+T. Results are kept for these.
+        private const int MaxClosedTabs = 5;
+        private readonly LinkedList<TabItem> _closedTabs = new LinkedList<TabItem>();
+
+        // Column header right-click menu
+        private WinForms.ContextMenuStrip? _headerMenu;
+        private int _headerMenuColumn = -1;
 
         // Log history fields (last 50 messages)
         private readonly List<string> _logHistory = new List<string>();
@@ -71,7 +88,13 @@ namespace ODBSee
             public string QueryText { get; set; } = "";
             public string SelectedDsn { get; set; } = "";
             public string User { get; set; } = "";
-            public string Password { get; set; } = "";
+
+            /// <summary>Password encrypted with Windows DPAPI (current user). See <see cref="Secret"/>.</summary>
+            public string EncryptedPassword { get; set; } = "";
+
+            /// <summary>Legacy plain-text password from older versions. Read once for migration, never written.</summary>
+            [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+            public string? Password { get; set; }
         }
 
         public MainWindow()
@@ -79,9 +102,23 @@ namespace ODBSee
             InitializeComponent();
             SetupWinFormsGrid();
 
-            // Set up hover underline dynamic micro-animation for status bar
-            StatusInfo.MouseEnter += (s, e) => StatusInfo.TextDecorations = TextDecorations.Underline;
-            StatusInfo.MouseLeave += (s, e) => StatusInfo.TextDecorations = null;
+            // The WinForms grid doesn't use WPF resources, so it's themed by hand (and re-themed on switch)
+            ApplyGridTheme();
+            ThemeManager.ThemeChanged += ApplyGridTheme;
+
+            TxtMaxRows.Text = _settings.DefaultMaxRows.ToString();
+            ChkCopyWithHeaders.IsChecked = _settings.CopyWithHeadersDefault;
+
+            // Hover underline for the clickable status bar items
+            foreach (var link in new[] { StatusInfo, BtnCheckUpdate, BtnSettings, BtnFeedback })
+            {
+                var l = link;
+                l.MouseEnter += (s, e) => l.TextDecorations = TextDecorations.Underline;
+                l.MouseLeave += (s, e) => l.TextDecorations = null;
+            }
+
+            // Window-wide shortcuts (Ctrl+Enter / F5 to run, Ctrl+Shift+T to reopen a closed tab)
+            PreviewKeyDown += Window_PreviewKeyDown;
 
             // Register closing handler to save session on exit
             this.Closing += (s, e) => SaveSession();
@@ -110,6 +147,8 @@ namespace ODBSee
             }
 
             LogStatus("Application started. Ready.");
+
+            _ = RetryPendingFeedbackAsync();
         }
 
         private void LogStatus(string message)
@@ -126,6 +165,9 @@ namespace ODBSee
                 }
             }
 
+            // Also keep a rolling log on disk (%LocalAppData%\ODBSee\activity.log) for diagnosing issues later
+            AppStorage.AppendLog(AppStorage.ActivityLogFile, logLine);
+
             if (!Dispatcher.CheckAccess())
             {
                 Dispatcher.Invoke(() => StatusInfo.Text = message);
@@ -135,6 +177,10 @@ namespace ODBSee
                 StatusInfo.Text = message;
             }
         }
+
+        // ------------------------------------------------------------------
+        // Session persistence
+        // ------------------------------------------------------------------
 
         private void SaveSession()
         {
@@ -157,32 +203,19 @@ namespace ODBSee
                 {
                     if (tab.Tag is TabState state && tab.Content is TextBox tb)
                     {
-                        string headerText = "Query";
-                        if (tab.Header is StackPanel sp && sp.Children[0] is Label lbl)
-                        {
-                            headerText = lbl.Content?.ToString() ?? "Query";
-                        }
-
                         session.Tabs.Add(new TabSessionInfo
                         {
-                            Header = headerText,
+                            Header = GetTabTitle(tab),
                             QueryText = tb.Text,
                             SelectedDsn = state.SelectedDsn,
                             User = state.User,
-                            Password = state.Password
+                            EncryptedPassword = _settings.RememberPasswords ? Secret.Protect(state.Password) : "",
+                            Password = null // never write plain text
                         });
                     }
                 }
 
-                var appDataPath = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "ODBSee");
-                if (!Directory.Exists(appDataPath))
-                {
-                    Directory.CreateDirectory(appDataPath);
-                }
-
-                var filePath = Path.Combine(appDataPath, "session_state.json");
-                var json = JsonSerializer.Serialize(session, new JsonSerializerOptions { WriteIndented = true });
-                File.WriteAllText(filePath, json, Encoding.UTF8);
+                AppStorage.WriteJson(AppStorage.SessionFile, session);
             }
             catch (Exception ex)
             {
@@ -194,22 +227,32 @@ namespace ODBSee
         {
             try
             {
-                var appDataPath = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "ODBSee");
-                var filePath = Path.Combine(appDataPath, "session_state.json");
-                if (!File.Exists(filePath)) return false;
-
-                var json = File.ReadAllText(filePath, Encoding.UTF8);
-                var session = JsonSerializer.Deserialize<SessionState>(json);
+                var session = AppStorage.ReadJson<SessionState>(AppStorage.SessionFile);
                 if (session == null || session.Tabs.Count == 0) return false;
+
+                bool hadPlainText = false;
 
                 QueryTabs.Items.Clear();
                 foreach (var tabInfo in session.Tabs)
                 {
+                    string password = "";
+                    if (!string.IsNullOrEmpty(tabInfo.EncryptedPassword))
+                    {
+                        password = Secret.Unprotect(tabInfo.EncryptedPassword);
+                    }
+                    else if (!string.IsNullOrEmpty(tabInfo.Password))
+                    {
+                        password = tabInfo.Password; // migrate from older plain-text session file
+                        hadPlainText = true;
+                    }
+
+                    if (!_settings.RememberPasswords) password = "";
+
                     CreateNewTabInternal(tabInfo.Header, tabInfo.QueryText, new TabState
                     {
                         SelectedDsn = tabInfo.SelectedDsn,
                         User = tabInfo.User,
-                        Password = tabInfo.Password
+                        Password = password
                     });
                 }
 
@@ -223,6 +266,13 @@ namespace ODBSee
                     QueryTabs.SelectedIndex = 0;
                 }
 
+                if (hadPlainText)
+                {
+                    // Rewrite the session file right away so plain-text passwords don't linger on disk
+                    SaveSession();
+                    LogStatus("Saved passwords are now encrypted.");
+                }
+
                 LogStatus($"Restored {session.Tabs.Count} queries from previous session.");
                 return true;
             }
@@ -233,261 +283,58 @@ namespace ODBSee
             }
         }
 
+        // ------------------------------------------------------------------
+        // Query execution
+        // ------------------------------------------------------------------
+
         private void SetQueryRunningState(bool isRunning)
         {
-            if (isRunning)
+            var color = isRunning ? "#D13438" : "#007ACC";
+            var text = isRunning ? "■ Stop" : "▶ Execute";
+
+            BtnExecute.Background = new System.Windows.Media.SolidColorBrush((System.Windows.Media.Color)System.Windows.Media.ColorConverter.ConvertFromString(color));
+            BtnExecute.IsEnabled = true;
+
+            if (BtnExecute.Content is TextBlock tb)
             {
-                BtnExecute.Background = new System.Windows.Media.SolidColorBrush((System.Windows.Media.Color)System.Windows.Media.ColorConverter.ConvertFromString("#D13438"));
-                
-                if (BtnExecute.Content is TextBlock tb)
-                {
-                    tb.Text = "■ Stop";
-                }
-                else
-                {
-                    BtnExecute.Content = new TextBlock { Text = "■ Stop" };
-                }
+                tb.Text = text;
             }
             else
             {
-                BtnExecute.Background = new System.Windows.Media.SolidColorBrush((System.Windows.Media.Color)System.Windows.Media.ColorConverter.ConvertFromString("#007ACC"));
-                
-                if (BtnExecute.Content is TextBlock tb)
-                {
-                    tb.Text = "▶ Execute";
-                }
-                else
-                {
-                    BtnExecute.Content = new TextBlock { Text = "▶ Execute" };
-                }
+                BtnExecute.Content = new TextBlock { Text = text };
             }
         }
 
         private void CancelQuery()
         {
-            if (_currentCts != null)
+            var cts = _currentCts;
+            if (cts == null || cts.IsCancellationRequested) return;
+
+            LogStatus("Query cancellation requested by user...");
+            cts.Cancel();
+
+            if (BtnExecute.Content is TextBlock tb) tb.Text = "Stopping...";
+            BtnExecute.IsEnabled = false;
+
+            // While rows are being fetched, the token alone stops the read loop (same path as hitting Max Rows),
+            // so we don't poke the driver from another thread mid-fetch. Only a query that is still waiting on the
+            // server (inside ExecuteReader) needs an ODBC-level cancel. That runs off the UI thread so a slow
+            // driver can't freeze the window, and under a lock so it never touches a command that's been disposed.
+            Task.Run(() =>
             {
-                LogStatus("Query cancellation requested by user...");
-                try
+                lock (_commandLock)
                 {
-                    _currentCts.Cancel();
-                    _currentCommand?.Cancel();
+                    if (_currentCommand == null || !_inExecuteReader) return;
+                    try
+                    {
+                        _currentCommand.Cancel();
+                    }
+                    catch (Exception ex)
+                    {
+                        LogStatus($"Driver error while cancelling (ignored): {ex.Message}");
+                    }
                 }
-                catch (Exception ex)
-                {
-                    LogStatus($"Error while calling Cancel on command: {ex.Message}");
-                }
-            }
-        }
-
-        private void StatusInfo_MouseLeftButtonUp(object sender, System.Windows.Input.MouseButtonEventArgs e)
-        {
-            var logWindow = new Window
-            {
-                Title = "ODBSee Log History",
-                Width = 650,
-                Height = 450,
-                WindowStartupLocation = WindowStartupLocation.CenterOwner,
-                Owner = this,
-                Background = System.Windows.Media.Brushes.White,
-                ShowInTaskbar = false
-            };
-
-            var grid = new Grid { Margin = new Thickness(12) };
-            grid.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
-            grid.RowDefinitions.Add(new RowDefinition { Height = new GridLength(1, GridUnitType.Star) });
-            grid.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
-
-            var header = new TextBlock
-            {
-                Text = "ODBSee Activity Logs (Last 50 messages)",
-                FontSize = 14,
-                FontWeight = FontWeights.Bold,
-                Margin = new Thickness(0, 0, 0, 10),
-                Foreground = new System.Windows.Media.SolidColorBrush((System.Windows.Media.Color)System.Windows.Media.ColorConverter.ConvertFromString("#333333"))
-            };
-            Grid.SetRow(header, 0);
-            grid.Children.Add(header);
-
-            string logsText;
-            lock (_logLock)
-            {
-                logsText = string.Join(Environment.NewLine, _logHistory);
-            }
-
-            var logBox = new TextBox
-            {
-                Text = string.IsNullOrEmpty(logsText) ? "No log history recorded yet." : logsText,
-                IsReadOnly = true,
-                FontFamily = new System.Windows.Media.FontFamily("Consolas"),
-                FontSize = 11,
-                AcceptsReturn = true,
-                VerticalScrollBarVisibility = ScrollBarVisibility.Auto,
-                HorizontalScrollBarVisibility = ScrollBarVisibility.Auto,
-                Background = new System.Windows.Media.SolidColorBrush((System.Windows.Media.Color)System.Windows.Media.ColorConverter.ConvertFromString("#F8F9FA")),
-                Foreground = new System.Windows.Media.SolidColorBrush((System.Windows.Media.Color)System.Windows.Media.ColorConverter.ConvertFromString("#212529")),
-                Padding = new Thickness(8),
-                BorderBrush = new System.Windows.Media.SolidColorBrush((System.Windows.Media.Color)System.Windows.Media.ColorConverter.ConvertFromString("#CED4DA")),
-                BorderThickness = new Thickness(1)
-            };
-            Grid.SetRow(logBox, 1);
-            grid.Children.Add(logBox);
-
-            var btnPanel = new StackPanel
-            {
-                Orientation = Orientation.Horizontal,
-                HorizontalAlignment = System.Windows.HorizontalAlignment.Right,
-                Margin = new Thickness(0, 12, 0, 0)
-            };
-            Grid.SetRow(btnPanel, 2);
-            grid.Children.Add(btnPanel);
-
-            var copyBtn = new Button
-            {
-                Content = "Copy to Clipboard",
-                Padding = new Thickness(12, 6, 12, 6),
-                Margin = new Thickness(0, 0, 10, 0)
-            };
-            copyBtn.Click += (s2, e2) =>
-            {
-                try
-                {
-                    System.Windows.Clipboard.SetText(logsText);
-                    MessageBox.Show("Logs copied to clipboard!", "Copied", MessageBoxButton.OK, MessageBoxImage.Information);
-                }
-                catch (Exception ex)
-                {
-                    MessageBox.Show($"Failed to copy logs: {ex.Message}", "Error", MessageBoxButton.OK, MessageBoxImage.Error);
-                }
-            };
-            btnPanel.Children.Add(copyBtn);
-
-            var closeBtn = new Button
-            {
-                Content = "Close",
-                Padding = new Thickness(18, 6, 18, 6),
-                IsDefault = true
-            };
-            closeBtn.Click += (s2, e2) => logWindow.Close();
-            btnPanel.Children.Add(closeBtn);
-
-            logWindow.Content = grid;
-            logWindow.ShowDialog();
-        }
-
-        private void SetupWinFormsGrid()
-        {
-            WfGrid.VirtualMode = true;
-            WfGrid.ReadOnly = true;
-            WfGrid.AllowUserToAddRows = false;
-            WfGrid.RowHeadersVisible = true; // Make row headers visible so users can select entire rows by clicking headers
-            WfGrid.RowHeadersWidth = 40; // Set a nice default width for the row headers
-            WfGrid.AllowUserToResizeRows = false;
-            WfGrid.AllowUserToResizeColumns = true;
-            WfGrid.ClipboardCopyMode = WinForms.DataGridViewClipboardCopyMode.Disable; //disable native copy so we can do our own functional copy
-            WfGrid.SelectionMode = WinForms.DataGridViewSelectionMode.RowHeaderSelect; // Allows both cell block and row selections!
-
-            //listener for manual copy method
-            WfGrid.KeyDown += WfGrid_KeyDown;
-
-            typeof(DataGridView).GetProperty("DoubleBuffered", BindingFlags.Instance | BindingFlags.NonPublic)
-                ?.SetValue(WfGrid, true, null);
-
-            WfGrid.CellValueNeeded += (s, e) =>
-            {
-                if (e.RowIndex < _cachedData.Count && e.ColumnIndex < _columnNames.Count)
-                {
-                    e.Value = _cachedData[e.RowIndex][e.ColumnIndex];
-                }
-            };
-
-            
-            WfGrid.ColumnHeaderMouseClick += (_, e) =>
-            {
-                if (_cachedData.Count == 0) return;
-
-                var colIndex = e.ColumnIndex;
-
-                
-                if (colIndex == _lastSortColumnIndex)
-                {
-                    _sortAscending = !_sortAscending;
-                }
-                else
-                {
-                    _sortAscending = true;
-                    _lastSortColumnIndex = colIndex;
-                }
-
-                // Perform the sort and sync back to tab state
-                if (_sortAscending)
-                {
-                    _cachedData = _cachedData.OrderBy(x => x[colIndex]).ToList();
-                }
-                else
-                {
-                    _cachedData = _cachedData.OrderByDescending(x => x[colIndex]).ToList();
-                }
-
-                // Sync back to the active tab state so it persists
-                if (QueryTabs.SelectedItem is TabItem currentTab && currentTab.Tag is TabState state)
-                {
-                    state.CachedData = _cachedData;
-                    state.LastSortColumnIndex = _lastSortColumnIndex;
-                    state.SortAscending = _sortAscending;
-                }
-
-                WfGrid.Invalidate();
-            };
-        }
-
-        private void QueryTabs_SelectionChanged(object sender, SelectionChangedEventArgs e)
-        {
-            // 1. Save connection credentials for any tab being deselected
-            if (e.RemovedItems.Count > 0 && e.RemovedItems[0] is TabItem prevTab && prevTab.Tag is TabState prevState)
-            {
-                prevState.SelectedDsn = _selectedDsn;
-                prevState.User = TxtUser.Text;
-                prevState.Password = TxtPass.Password;
-            }
-
-            // 2. Load connection credentials and grid data for the newly selected tab
-            if (QueryTabs.SelectedItem is TabItem currentTab && currentTab.Tag is TabState state)
-            {
-                // Sync tab credentials back to the connection pane
-                _selectedDsn = state.SelectedDsn;
-                BtnDatasource.Content = string.IsNullOrEmpty(_selectedDsn) ? "Select Datasource..." : _selectedDsn;
-                TxtUser.Text = state.User;
-                TxtPass.Password = state.Password;
-
-                RefreshGridFromState(state);
-            }
-        }
-
-        private void RefreshGridFromState(TabState state)
-        {
-            // Update global references used by virtual grid and sorting
-            _cachedData = state.CachedData;
-            _columnNames = state.ColumnNames;
-            _lastSortColumnIndex = state.LastSortColumnIndex;
-            _sortAscending = state.SortAscending;
-
-            WfGrid.Columns.Clear();
-            foreach (var colName in _columnNames)
-            {
-                var col = new WinForms.DataGridViewTextBoxColumn
-                {
-                    HeaderText = colName,
-                    Name = colName,
-                    SortMode = WinForms.DataGridViewColumnSortMode.Programmatic
-                };
-                WfGrid.Columns.Add(col);
-            }
-
-            WfGrid.RowCount = _cachedData.Count;
-            StatusRowCount.Text = $"{_cachedData.Count} Rows";
-            
-            WfGrid.Invalidate();
+            });
         }
 
         private void BtnExecute_Click(object sender, RoutedEventArgs e)
@@ -497,7 +344,7 @@ namespace ODBSee
 
         private async void ExecuteQuery()
         {
-            // Cancel any existing execution
+            // Button doubles as Stop while a query is running
             if (_currentCts != null)
             {
                 CancelQuery();
@@ -515,34 +362,40 @@ namespace ODBSee
                 return;
             }
 
+            var dsn = _selectedDsn;
             var queryText = activeBox.Text;
             var userId = TxtUser.Text;
             var password = TxtPass.Password;
             int.TryParse(TxtMaxRows.Text, out var maxRows);
-            if (maxRows <= 0) maxRows = 1000;
+            if (maxRows <= 0) maxRows = _settings.DefaultMaxRows > 0 ? _settings.DefaultMaxRows : 1000;
+            var connectTimeout = Math.Max(0, _settings.ConnectTimeoutSeconds);
+            var commandTimeout = Math.Max(0, _settings.CommandTimeoutSeconds);
 
-            LogStatus($"Executing query on DSN '{_selectedDsn}' (Limit: {maxRows} rows)...");
-            var connString = $"DSN={_selectedDsn};Uid={userId};Pwd={password};Connect Timeout=300;";
+            LogStatus($"Executing query on DSN '{dsn}' (Limit: {maxRows} rows)...");
+            var connString = $"DSN={dsn};Uid={userId};Pwd={password};";
 
-            _currentCts = new CancellationTokenSource();
-            var token = _currentCts.Token;
+            var cts = new CancellationTokenSource();
+            _currentCts = cts;
+            var token = cts.Token;
+            var started = DateTime.Now;
 
-            // Set UI executing state
             SetQueryRunningState(true);
 
             try
             {
-                if (_selectedDsn == "DUMMY" || _selectedDsn == "DUMMY_10s")
+                Task<(List<string> Columns, List<string[]> Rows)> task;
+                if (dsn == "DUMMY" || dsn == "DUMMY_10s")
                 {
-                    bool isLongDelay = _selectedDsn == "DUMMY_10s";
-                    _runningQueryTask = Task.Run(() => GenerateDummyData(maxRows, isLongDelay), token);
+                    bool isLongDelay = dsn == "DUMMY_10s";
+                    task = Task.Run(() => GenerateDummyData(maxRows, isLongDelay, token), token);
                 }
                 else
                 {
-                    _runningQueryTask = Task.Run(() => FetchData(connString, queryText, maxRows), token);
+                    task = Task.Run(() => FetchData(connString, queryText, maxRows, connectTimeout, commandTimeout, token), token);
                 }
 
-                var (columns, rows) = await (Task<(List<string>, List<string[]>)>)_runningQueryTask;
+                var (columns, rows) = await task;
+                var elapsed = DateTime.Now - started;
 
                 state.ColumnNames = columns;
                 state.CachedData = rows;
@@ -554,11 +407,11 @@ namespace ODBSee
                 {
                     RefreshGridFromState(state);
                     StatusConnection.Text = "Connected";
-                    LogStatus($"Query executed successfully: returned {rows.Count} rows.");
+                    LogStatus($"Query executed successfully: returned {rows.Count} rows in {elapsed.TotalSeconds:F1}s.");
                 }
                 else
                 {
-                    LogStatus($"Background query finished: returned {rows.Count} rows.");
+                    LogStatus($"Background query finished: returned {rows.Count} rows in {elapsed.TotalSeconds:F1}s.");
                 }
             }
             catch (OperationCanceledException)
@@ -591,80 +444,437 @@ namespace ODBSee
             }
             finally
             {
-                if (_currentCts?.Token == token)
+                if (_currentCts == cts)
                 {
                     _currentCts = null;
-                    _runningQueryTask = null;
                 }
                 SetQueryRunningState(false);
             }
         }
 
-        private (List<string> Columns, List<string[]> Rows) GenerateDummyData(int maxRows, bool isLongDelay)
+        private static (List<string> Columns, List<string[]> Rows) GenerateDummyData(int maxRows, bool isLongDelay, CancellationToken token)
         {
             var columns = new List<string> { "ID", "Name", "Category", "Value", "Status", "Last Modified" };
             var rows = new List<string[]>();
             var rand = new Random();
-            
+
             // Loop and sleep in 100ms chunks to ensure rapid responsiveness to stop/cancellation commands
             int totalSleepMs = isLongDelay ? 10000 : 300;
             int intervalMs = 100;
             int elapsedMs = 0;
-            
+
             while (elapsedMs < totalSleepMs)
             {
-                if (_currentCts?.IsCancellationRequested == true)
-                    throw new OperationCanceledException();
-                
+                token.ThrowIfCancellationRequested();
                 Thread.Sleep(intervalMs);
                 elapsedMs += intervalMs;
             }
 
             for (int i = 1; i <= maxRows; i++)
             {
-                if (_currentCts?.IsCancellationRequested == true)
-                    throw new OperationCanceledException();
+                token.ThrowIfCancellationRequested();
 
-                rows.Add(new string[] { 
-                    i.ToString(), 
-                    $"Dummy Record {i}", 
+                rows.Add(new string[] {
+                    i.ToString(),
+                    $"Dummy Record {i}",
                     rand.Next(0, 2) == 0 ? "Production" : "Staging",
-                    (rand.NextDouble() * 1000).ToString("F2"), 
+                    (rand.NextDouble() * 1000).ToString("F2"),
                     rand.Next(0, 3) switch { 0 => "Active", 1 => "Pending", _ => "Archived" },
-                    DateTime.Now.AddDays(-rand.Next(1, 30)).ToString("yyyy-MM-dd HH:mm:ss")
+                    DateTime.Now.AddDays(-rand.Next(1, 400)).AddMinutes(-rand.Next(0, 1440)).ToString()
                 });
             }
 
             return (columns, rows);
         }
 
-        private (List<string> Columns, List<string[]> Rows) FetchData(string connString, string sql, int maxRows)
+        private (List<string> Columns, List<string[]> Rows) FetchData(string connString, string sql, int maxRows,
+            int connectTimeout, int commandTimeout, CancellationToken token)
         {
             var cols = new List<string>();
             var rows = new List<string[]>();
-            using var conn = new OdbcConnection(connString);
-            conn.Open();
-            using var cmd = new OdbcCommand(sql, conn);
-            _currentCommand = cmd;
-            cmd.CommandTimeout = 300; //5 mins
-            using var reader = cmd.ExecuteReader();
-            for (var i = 0; i < reader.FieldCount; i++)
-                cols.Add(reader.GetName(i));
-            int count = 0;
-            while (reader.Read() && count < maxRows)
-            {
-                if (_currentCts?.IsCancellationRequested == true)
-                    throw new OperationCanceledException();
 
-                string[] row = new string[reader.FieldCount];
-                for (int i = 0; i < reader.FieldCount; i++)
-                    row[i] = reader[i]?.ToString() ?? "";
-                rows.Add(row);
-                count++;
+            using var conn = new OdbcConnection(connString);
+            // Set via the property (SQL_ATTR_LOGIN_TIMEOUT): drivers often ignore "Connect Timeout" in the string
+            conn.ConnectionTimeout = connectTimeout;
+            conn.Open();
+            token.ThrowIfCancellationRequested();
+
+            using var cmd = new OdbcCommand(sql, conn);
+            cmd.CommandTimeout = commandTimeout;
+
+            lock (_commandLock)
+            {
+                _currentCommand = cmd;
+                _inExecuteReader = true;
             }
-            _currentCommand = null;
+
+            try
+            {
+                OdbcDataReader reader;
+                try
+                {
+                    reader = cmd.ExecuteReader();
+                }
+                finally
+                {
+                    lock (_commandLock) _inExecuteReader = false;
+                }
+
+                using (reader)
+                {
+                    token.ThrowIfCancellationRequested();
+
+                    for (var i = 0; i < reader.FieldCount; i++)
+                        cols.Add(reader.GetName(i));
+
+                    int fieldCount = reader.FieldCount;
+                    // Check the count first so we don't fetch one row more than we keep
+                    while (rows.Count < maxRows && reader.Read())
+                    {
+                        token.ThrowIfCancellationRequested();
+
+                        string[] row = new string[fieldCount];
+                        for (int i = 0; i < fieldCount; i++)
+                            row[i] = reader[i]?.ToString() ?? "";
+                        rows.Add(row);
+                    }
+                }
+            }
+            finally
+            {
+                // Always clear the shared reference (before cmd is disposed) so Cancel can never hit a dead command
+                lock (_commandLock)
+                {
+                    _currentCommand = null;
+                    _inExecuteReader = false;
+                }
+            }
+
             return (cols, rows);
         }
+
+        // ------------------------------------------------------------------
+        // Results grid
+        // ------------------------------------------------------------------
+
+        private void SetupWinFormsGrid()
+        {
+            WfGrid.VirtualMode = true;
+            WfGrid.ReadOnly = true;
+            WfGrid.AllowUserToAddRows = false;
+            WfGrid.RowHeadersVisible = true; // Make row headers visible so users can select entire rows by clicking headers
+            WfGrid.RowHeadersWidth = 40; // Set a nice default width for the row headers
+            WfGrid.AllowUserToResizeRows = false;
+            WfGrid.AllowUserToResizeColumns = true;
+            WfGrid.ClipboardCopyMode = WinForms.DataGridViewClipboardCopyMode.Disable; //disable native copy so we can do our own functional copy
+            WfGrid.SelectionMode = WinForms.DataGridViewSelectionMode.RowHeaderSelect; // Allows both cell block and row selections!
+
+            //listener for manual copy method + shortcuts while the grid has focus
+            WfGrid.KeyDown += WfGrid_KeyDown;
+
+            typeof(WinForms.DataGridView).GetProperty("DoubleBuffered", BindingFlags.Instance | BindingFlags.NonPublic)
+                ?.SetValue(WfGrid, true, null);
+
+            WfGrid.CellValueNeeded += (s, e) =>
+            {
+                if (e.RowIndex < _cachedData.Count && e.ColumnIndex < _columnNames.Count)
+                {
+                    var row = _cachedData[e.RowIndex];
+                    if (e.ColumnIndex < row.Length) e.Value = row[e.ColumnIndex];
+                }
+            };
+
+            // A "Select Column" puts the grid in column-select mode. Any normal left click on a header
+            // (row header, column header, corner) switches back to the usual row/cell selection first.
+            // Ctrl+click on a column header while in column mode adds/removes columns instead.
+            WfGrid.MouseDown += (s, e) =>
+            {
+                if (e.Button != WinForms.MouseButtons.Left) return;
+                if (WfGrid.SelectionMode != WinForms.DataGridViewSelectionMode.ColumnHeaderSelect) return;
+
+                var hit = WfGrid.HitTest(e.X, e.Y);
+                bool ctrl = (WinForms.Control.ModifierKeys & WinForms.Keys.Control) == WinForms.Keys.Control;
+                bool header = hit.Type == WinForms.DataGridViewHitTestType.ColumnHeader;
+
+                if ((header && !ctrl) ||
+                    hit.Type == WinForms.DataGridViewHitTestType.RowHeader ||
+                    hit.Type == WinForms.DataGridViewHitTestType.TopLeftHeader)
+                {
+                    WfGrid.SelectionMode = WinForms.DataGridViewSelectionMode.RowHeaderSelect;
+                }
+            };
+
+            // Left click on a header sorts, right click opens the column menu
+            WfGrid.ColumnHeaderMouseClick += (_, e) =>
+            {
+                if (e.ColumnIndex < 0) return;
+
+                if (e.Button == WinForms.MouseButtons.Right)
+                {
+                    ShowHeaderMenu(e.ColumnIndex);
+                    return;
+                }
+
+                if (e.Button != WinForms.MouseButtons.Left) return;
+
+                // Ctrl+click in column-select mode is a selection gesture, not a sort
+                if (WfGrid.SelectionMode == WinForms.DataGridViewSelectionMode.ColumnHeaderSelect) return;
+
+                _ = SortColumnAsync(e.ColumnIndex, null);
+            };
+
+            BuildHeaderMenu();
+        }
+
+        private void BuildHeaderMenu()
+        {
+            _headerMenu = new WinForms.ContextMenuStrip();
+
+            var sortAsc = new WinForms.ToolStripMenuItem("Sort Ascending");
+            sortAsc.Click += (s, e) => { if (_headerMenuColumn >= 0) _ = SortColumnAsync(_headerMenuColumn, true); };
+
+            var sortDesc = new WinForms.ToolStripMenuItem("Sort Descending");
+            sortDesc.Click += (s, e) => { if (_headerMenuColumn >= 0) _ = SortColumnAsync(_headerMenuColumn, false); };
+
+            var select = new WinForms.ToolStripMenuItem("Select Column");
+            select.Click += (s, e) => SelectColumn(_headerMenuColumn);
+
+            var copy = new WinForms.ToolStripMenuItem("Copy Column");
+            copy.Click += (s, e) => { if (_headerMenuColumn >= 0) CopyColumns(new[] { _headerMenuColumn }); };
+
+            _headerMenu.Items.AddRange(new WinForms.ToolStripItem[]
+            {
+                sortAsc, sortDesc, new WinForms.ToolStripSeparator(), select, copy
+            });
+        }
+
+        // Stock WinForms look, captured once so Light mode is exactly what it was before theming existed
+        private (WinForms.DataGridViewCellStyle Cells, WinForms.DataGridViewCellStyle ColHeaders, WinForms.DataGridViewCellStyle RowHeaders,
+                 System.Drawing.Color Background, System.Drawing.Color GridLines)? _gridLightLook;
+
+        private void ApplyGridTheme()
+        {
+            _gridLightLook ??= (WfGrid.DefaultCellStyle.Clone(), WfGrid.ColumnHeadersDefaultCellStyle.Clone(),
+                                WfGrid.RowHeadersDefaultCellStyle.Clone(), WfGrid.BackgroundColor, WfGrid.GridColor);
+
+            if (ThemeManager.IsDark)
+            {
+                var panel = System.Drawing.Color.FromArgb(0x25, 0x25, 0x26);
+                var header = System.Drawing.Color.FromArgb(0x2D, 0x2D, 0x30);
+                var text = System.Drawing.Color.FromArgb(0xDC, 0xDC, 0xDC);
+                var selection = System.Drawing.Color.FromArgb(0x26, 0x4F, 0x78);
+
+                WfGrid.EnableHeadersVisualStyles = false; // required for custom header colors
+                WfGrid.BackgroundColor = System.Drawing.Color.FromArgb(0x1E, 0x1E, 0x1E);
+                WfGrid.GridColor = System.Drawing.Color.FromArgb(0x3F, 0x3F, 0x46);
+                WfGrid.DefaultCellStyle.BackColor = panel;
+                WfGrid.DefaultCellStyle.ForeColor = text;
+                WfGrid.DefaultCellStyle.SelectionBackColor = selection;
+                WfGrid.DefaultCellStyle.SelectionForeColor = System.Drawing.Color.White;
+
+                foreach (var style in new[] { WfGrid.ColumnHeadersDefaultCellStyle, WfGrid.RowHeadersDefaultCellStyle })
+                {
+                    style.BackColor = header;
+                    style.ForeColor = text;
+                    style.SelectionBackColor = System.Drawing.Color.FromArgb(0x3E, 0x3E, 0x40);
+                    style.SelectionForeColor = text;
+                }
+                WfGrid.ColumnHeadersBorderStyle = WinForms.DataGridViewHeaderBorderStyle.Single;
+                WfGrid.RowHeadersBorderStyle = WinForms.DataGridViewHeaderBorderStyle.Single;
+            }
+            else
+            {
+                var look = _gridLightLook.Value;
+                WfGrid.EnableHeadersVisualStyles = true;
+                WfGrid.BackgroundColor = look.Background;
+                WfGrid.GridColor = look.GridLines;
+                WfGrid.DefaultCellStyle = look.Cells.Clone();
+                WfGrid.ColumnHeadersDefaultCellStyle = look.ColHeaders.Clone();
+                WfGrid.RowHeadersDefaultCellStyle = look.RowHeaders.Clone();
+                WfGrid.ColumnHeadersBorderStyle = WinForms.DataGridViewHeaderBorderStyle.Raised;
+                WfGrid.RowHeadersBorderStyle = WinForms.DataGridViewHeaderBorderStyle.Raised;
+            }
+
+            // Native scrollbars inside the grid follow the Windows dark/light scrollbar theme
+            foreach (WinForms.Control child in WfGrid.Controls)
+            {
+                if (child is WinForms.ScrollBar) ThemeManager.ApplyNativeTheme(child.Handle);
+            }
+
+            if (_headerMenu != null)
+            {
+                _headerMenu.Renderer = ThemeManager.IsDark
+                    ? new WinForms.ToolStripProfessionalRenderer(new DarkMenuColors())
+                    : new WinForms.ToolStripProfessionalRenderer();
+                foreach (WinForms.ToolStripItem item in _headerMenu.Items)
+                {
+                    item.ForeColor = ThemeManager.IsDark ? System.Drawing.Color.FromArgb(0xDC, 0xDC, 0xDC) : System.Drawing.SystemColors.ControlText;
+                }
+            }
+
+            WfGrid.Invalidate(true);
+        }
+
+        private sealed class DarkMenuColors : WinForms.ProfessionalColorTable
+        {
+            private static readonly System.Drawing.Color Bg = System.Drawing.Color.FromArgb(0x2B, 0x2B, 0x2B);
+            private static readonly System.Drawing.Color Hover = System.Drawing.Color.FromArgb(0x3E, 0x3E, 0x40);
+            private static readonly System.Drawing.Color Line = System.Drawing.Color.FromArgb(0x55, 0x55, 0x59);
+
+            public override System.Drawing.Color ToolStripDropDownBackground => Bg;
+            public override System.Drawing.Color ImageMarginGradientBegin => Bg;
+            public override System.Drawing.Color ImageMarginGradientMiddle => Bg;
+            public override System.Drawing.Color ImageMarginGradientEnd => Bg;
+            public override System.Drawing.Color MenuBorder => Line;
+            public override System.Drawing.Color MenuItemBorder => Hover;
+            public override System.Drawing.Color MenuItemSelected => Hover;
+            public override System.Drawing.Color MenuItemSelectedGradientBegin => Hover;
+            public override System.Drawing.Color MenuItemSelectedGradientEnd => Hover;
+            public override System.Drawing.Color SeparatorDark => Line;
+            public override System.Drawing.Color SeparatorLight => Bg;
+        }
+
+        private void ShowHeaderMenu(int columnIndex)
+        {
+            if (_headerMenu == null || columnIndex >= _columnNames.Count) return;
+            _headerMenuColumn = columnIndex;
+            _headerMenu.Show(WinForms.Cursor.Position);
+        }
+
+        private void SelectColumn(int columnIndex)
+        {
+            if (columnIndex < 0 || columnIndex >= WfGrid.Columns.Count) return;
+
+            // Column selection is native (cheap) in ColumnHeaderSelect mode, even on huge result sets.
+            // Our columns use Programmatic sort mode, which this selection mode allows.
+            if (WfGrid.SelectionMode != WinForms.DataGridViewSelectionMode.ColumnHeaderSelect)
+            {
+                WfGrid.SelectionMode = WinForms.DataGridViewSelectionMode.ColumnHeaderSelect;
+            }
+            WfGrid.ClearSelection();
+            WfGrid.Columns[columnIndex].Selected = true;
+            WfGrid.Focus();
+        }
+
+        private async Task SortColumnAsync(int colIndex, bool? ascending)
+        {
+            if (_isSorting || _cachedData.Count == 0 || colIndex < 0 || colIndex >= _columnNames.Count) return;
+            if (QueryTabs.SelectedItem is not TabItem tab || tab.Tag is not TabState state) return;
+
+            bool asc = ascending ?? (colIndex == _lastSortColumnIndex ? !_sortAscending : true);
+            var source = _cachedData;
+
+            _isSorting = true;
+            var bigSort = source.Count > 50_000;
+            if (bigSort) WfGrid.Cursor = WinForms.Cursors.WaitCursor;
+
+            try
+            {
+                // Sorting runs in the background so the UI never stalls on big result sets
+                GridSort.Kind kind = GridSort.Kind.Text;
+                var sorted = await Task.Run(() => GridSort.Sort(source, colIndex, asc, out kind));
+
+                // Data was replaced (new query / cleared) while sorting: drop this result
+                if (!ReferenceEquals(state.CachedData, source)) return;
+
+                state.CachedData = sorted;
+                state.LastSortColumnIndex = colIndex;
+                state.SortAscending = asc;
+
+                if (QueryTabs.SelectedItem == tab)
+                {
+                    _cachedData = sorted;
+                    _lastSortColumnIndex = colIndex;
+                    _sortAscending = asc;
+                    ApplySortGlyphs();
+                    WfGrid.Invalidate();
+                }
+
+                if (bigSort)
+                {
+                    LogStatus($"Sorted {sorted.Count} rows by '{_columnNames.ElementAtOrDefault(colIndex)}' ({kind.ToString().ToLowerInvariant()}, {(asc ? "ascending" : "descending")}).");
+                }
+            }
+            catch (Exception ex)
+            {
+                LogStatus($"Sort failed: {ex.Message}");
+            }
+            finally
+            {
+                _isSorting = false;
+                if (bigSort) WfGrid.Cursor = WinForms.Cursors.Default;
+            }
+        }
+
+        private void ApplySortGlyphs()
+        {
+            for (int i = 0; i < WfGrid.Columns.Count; i++)
+            {
+                WfGrid.Columns[i].HeaderCell.SortGlyphDirection =
+                    i != _lastSortColumnIndex ? WinForms.SortOrder.None
+                    : _sortAscending ? WinForms.SortOrder.Ascending : WinForms.SortOrder.Descending;
+            }
+        }
+
+        private void QueryTabs_SelectionChanged(object sender, SelectionChangedEventArgs e)
+        {
+            // Only react to the tab control itself (TextBoxes inside tabs raise bubbling SelectionChanged too)
+            if (!ReferenceEquals(e.OriginalSource, QueryTabs)) return;
+
+            // 1. Save connection credentials for any tab being deselected
+            if (e.RemovedItems.Count > 0 && e.RemovedItems[0] is TabItem prevTab && prevTab.Tag is TabState prevState)
+            {
+                prevState.SelectedDsn = _selectedDsn;
+                prevState.User = TxtUser.Text;
+                prevState.Password = TxtPass.Password;
+            }
+
+            // 2. Load connection credentials and grid data for the newly selected tab
+            if (QueryTabs.SelectedItem is TabItem currentTab && currentTab.Tag is TabState state)
+            {
+                // Sync tab credentials back to the connection pane
+                _selectedDsn = state.SelectedDsn;
+                BtnDatasource.Content = string.IsNullOrEmpty(_selectedDsn) ? "Select Datasource..." : NoAccessKey(_selectedDsn);
+                TxtUser.Text = state.User;
+                TxtPass.Password = state.Password;
+
+                RefreshGridFromState(state);
+            }
+        }
+
+        private void RefreshGridFromState(TabState state)
+        {
+            // Update global references used by virtual grid and sorting
+            _cachedData = state.CachedData;
+            _columnNames = state.ColumnNames;
+            _lastSortColumnIndex = state.LastSortColumnIndex;
+            _sortAscending = state.SortAscending;
+
+            // Back to the normal selection mode before rebuilding columns
+            WfGrid.SelectionMode = WinForms.DataGridViewSelectionMode.RowHeaderSelect;
+
+            WfGrid.Columns.Clear();
+            foreach (var colName in _columnNames)
+            {
+                var col = new WinForms.DataGridViewTextBoxColumn
+                {
+                    HeaderText = colName,
+                    Name = colName,
+                    SortMode = WinForms.DataGridViewColumnSortMode.Programmatic
+                };
+                WfGrid.Columns.Add(col);
+            }
+
+            WfGrid.RowCount = _cachedData.Count;
+            StatusRowCount.Text = $"{_cachedData.Count} Rows";
+            ApplySortGlyphs();
+
+            WfGrid.Invalidate();
+        }
+
+        // ------------------------------------------------------------------
+        // Datasources
+        // ------------------------------------------------------------------
 
         public List<OdbcDsn> GetOdbcDataSources()
         {
@@ -752,10 +962,11 @@ namespace ODBSee
 
                 foreach (var source in group)
                 {
-                    var mi = new MenuItem { Header = source.Name };
+                    var dsnName = source.Name;
+                    var mi = new MenuItem { Header = NoAccessKey(dsnName) };
                     mi.Click += (s2, args) => {
-                        _selectedDsn = mi.Header.ToString() ?? "";
-                        BtnDatasource.Content = _selectedDsn;
+                        _selectedDsn = dsnName;
+                        BtnDatasource.Content = NoAccessKey(dsnName);
                         AutoFillDsnDetails(_selectedDsn);
                     };
                     groupMenu.Items.Add(mi);
@@ -767,10 +978,13 @@ namespace ODBSee
             DsnMenu.IsOpen = true;
         }
 
+        /// <summary>WPF buttons/menus treat "_" as an access-key marker and hide it ("MY_DSN" shows as "MYDSN"); doubling escapes it.</summary>
+        private static string NoAccessKey(string text) => text.Replace("_", "__");
+
         private void AutoFillDsnDetails(string dsnName)
         {
             if (dsnName == "DUMMY" || dsnName == "DUMMY_10s") return;
-            
+
             var path = $@"SOFTWARE\ODBC\ODBC.INI\{dsnName}";
 
             // Check HKEY_CURRENT_USER first
@@ -825,15 +1039,80 @@ namespace ODBSee
             catch { }
         }
 
-        private void TxtQuery_KeyDown(object sender, System.Windows.Input.KeyEventArgs e)
+        // ------------------------------------------------------------------
+        // Keyboard shortcuts
+        // ------------------------------------------------------------------
+
+        private enum Shortcut { None, Execute, ReopenTab }
+
+        private static Shortcut MatchShortcut(Key key, ModifierKeys mods)
         {
-            if (e.Key == System.Windows.Input.Key.Enter &&
-                (System.Windows.Input.Keyboard.Modifiers & System.Windows.Input.ModifierKeys.Control) == System.Windows.Input.ModifierKeys.Control)
+            if (key == Key.F5 && mods == ModifierKeys.None) return Shortcut.Execute;
+            if (key == Key.Enter && mods == ModifierKeys.Control) return Shortcut.Execute;
+            if (key == Key.T && mods == (ModifierKeys.Control | ModifierKeys.Shift)) return Shortcut.ReopenTab;
+            return Shortcut.None;
+        }
+
+        private void RunShortcut(Shortcut shortcut)
+        {
+            switch (shortcut)
             {
-                ExecuteQuery();
-                e.Handled = true;
+                case Shortcut.Execute:
+                    // Shortcuts only start queries; stopping stays a deliberate button click
+                    if (_currentCts == null) ExecuteQuery();
+                    break;
+                case Shortcut.ReopenTab:
+                    ReopenClosedTab();
+                    break;
             }
         }
+
+        private void Window_PreviewKeyDown(object sender, KeyEventArgs e)
+        {
+            // The WinForms grid handles its own keys (see WfGrid_KeyDown)
+            if (Host.IsKeyboardFocusWithin) return;
+
+            var shortcut = MatchShortcut(e.Key, Keyboard.Modifiers);
+            if (shortcut == Shortcut.None) return;
+
+            RunShortcut(shortcut);
+            e.Handled = true;
+        }
+
+        private void WfGrid_KeyDown(object? sender, WinForms.KeyEventArgs e)
+        {
+            if (e.Control && !e.Shift && !e.Alt && e.KeyCode == WinForms.Keys.C)
+            {
+                CopySelectedToCsv();
+                e.Handled = true;
+                return;
+            }
+
+            var mods = ModifierKeys.None;
+            if (e.Control) mods |= ModifierKeys.Control;
+            if (e.Shift) mods |= ModifierKeys.Shift;
+            if (e.Alt) mods |= ModifierKeys.Alt;
+
+            var key = e.KeyCode switch
+            {
+                WinForms.Keys.F5 => Key.F5,
+                WinForms.Keys.Enter => Key.Enter,
+                WinForms.Keys.T => Key.T,
+                _ => Key.None
+            };
+
+            var shortcut = MatchShortcut(key, mods);
+            if (shortcut == Shortcut.None) return;
+
+            e.Handled = true;
+            e.SuppressKeyPress = true;
+            // Let the WinForms key event finish before touching WPF state
+            Dispatcher.InvokeAsync(() => RunShortcut(shortcut));
+        }
+
+        // ------------------------------------------------------------------
+        // Files: open / save / export
+        // ------------------------------------------------------------------
 
         private void BtnOpen_Click(object sender, RoutedEventArgs e)
         {
@@ -888,7 +1167,7 @@ namespace ODBSee
                     if (QueryTabs.SelectedItem is TabItem currentTab && currentTab.Header is StackPanel sp)
                     {
                         if (sp.Children[0] is Label lbl)
-                            lbl.Content = Path.GetFileName(saveFileDialog.FileName);
+                            lbl.Content = new TextBlock { Text = Path.GetFileName(saveFileDialog.FileName) };
                     }
                 }
                 catch (Exception ex)
@@ -903,41 +1182,68 @@ namespace ODBSee
             if (_cachedData.Count == 0) return;
 
             var sfd = new SaveFileDialog { Filter = "CSV files (*.csv)|*.csv", FileName = "export.csv" };
-            if (sfd.ShowDialog() == true)
-            {
-                LogStatus("Exporting data to CSV...");
-                
-                var csv = await Task.Run(() => GenerateCsv(_cachedData, _columnNames));
+            if (sfd.ShowDialog() != true) return;
 
-                File.WriteAllText(sfd.FileName, csv, Encoding.UTF8);
-                LogStatus($"Exported result set successfully to {Path.GetFileName(sfd.FileName)}");
+            // Snapshot the references: sorting/clearing replaces these lists rather than modifying them
+            var data = _cachedData;
+            var headers = _columnNames;
+            var path = sfd.FileName;
+
+            BtnExport.IsEnabled = false;
+            LogStatus($"Exporting {data.Count} rows to CSV...");
+            try
+            {
+                await Task.Run(() => WriteCsv(path, data, headers));
+                LogStatus($"Exported {data.Count} rows to {Path.GetFileName(path)}");
+            }
+            catch (Exception ex)
+            {
+                LogStatus($"Export failed: {ex.Message}");
+                MessageBox.Show($"Export failed: {ex.Message}", "Export", MessageBoxButton.OK, MessageBoxImage.Error);
+            }
+            finally
+            {
+                BtnExport.IsEnabled = true;
             }
         }
 
-        //Manual copy method
-        private void WfGrid_KeyDown(object sender, WinForms.KeyEventArgs e)
+        /// <summary>Streams rows straight to disk instead of building the whole CSV in memory first.</summary>
+        private static void WriteCsv(string path, List<string[]> rows, List<string> headers)
         {
-            switch (e.Control)
+            using var writer = new StreamWriter(path, false, new UTF8Encoding(encoderShouldEmitUTF8Identifier: true), 1 << 16);
+
+            WriteCsvLine(writer, headers);
+            foreach (var row in rows)
             {
-
-                case (true):
-
-                    switch (e.KeyCode)
-                    {
-                        case (Keys.C):
-                            CopySelectedToCsv();
-                            e.Handled = true;
-                            break;
-                    }
-
-                    break;
+                WriteCsvLine(writer, row);
             }
         }
 
+        private static void WriteCsvLine(TextWriter writer, IReadOnlyList<string> fields)
+        {
+            for (int i = 0; i < fields.Count; i++)
+            {
+                if (i > 0) writer.Write(',');
+                writer.Write(EscapeCsvField(fields[i]));
+            }
+            writer.Write("\r\n");
+        }
 
+        // ------------------------------------------------------------------
+        // Clipboard
+        // ------------------------------------------------------------------
 
         private void CopySelectedToCsv()
         {
+            // Whole columns selected (via "Select Column"): copy straight from the cache, which is fast
+            // even on huge result sets (enumerating SelectedCells would build an object per cell).
+            if (WfGrid.SelectionMode == WinForms.DataGridViewSelectionMode.ColumnHeaderSelect && WfGrid.SelectedColumns.Count > 0)
+            {
+                var cols = WfGrid.SelectedColumns.Cast<WinForms.DataGridViewColumn>().Select(c => c.Index).OrderBy(i => i).ToArray();
+                CopyColumns(cols);
+                return;
+            }
+
             if (WfGrid.SelectedCells.Count == 0) return;
 
             // Group selected cells by RowIndex to format as rows
@@ -981,45 +1287,70 @@ namespace ODBSee
             }
         }
 
-
-        //CSV generation helpers
-        private string GenerateCsv(IEnumerable<string[]> rows, IEnumerable<string> headers = null)
+        private void CopyColumns(int[] columnIndices)
         {
+            var cols = columnIndices.Where(i => i >= 0 && i < _columnNames.Count).ToArray();
+            if (cols.Length == 0) return;
+
             var sb = new StringBuilder();
-
-            // Add headers
-            if (headers != null)
+            if (ChkCopyWithHeaders.IsChecked == true)
             {
-                sb.AppendLine(string.Join(",", headers.Select(EscapeCsvField)));
+                sb.Append(string.Join(",", cols.Select(i => EscapeCsvField(_columnNames[i]))));
+                sb.Append(Environment.NewLine);
             }
 
-            // Add rows
-            foreach (var row in rows)
+            foreach (var row in _cachedData)
             {
-                sb.AppendLine(string.Join(",", row.Select(EscapeCsvField)));
+                for (int c = 0; c < cols.Length; c++)
+                {
+                    if (c > 0) sb.Append(',');
+                    sb.Append(EscapeCsvField(cols[c] < row.Length ? row[cols[c]] : ""));
+                }
+                sb.Append(Environment.NewLine);
             }
 
-            return sb.ToString();
+            try
+            {
+                System.Windows.Clipboard.SetText(sb.ToString());
+                var name = cols.Length == 1 ? $"column '{_columnNames[cols[0]]}'" : $"{cols.Length} columns";
+                LogStatus($"Copied {name} ({_cachedData.Count} rows) to clipboard.");
+            }
+            catch (Exception ex)
+            {
+                LogStatus($"Copy failed: {ex.Message}");
+            }
         }
 
-        private string EscapeCsvField(string field)
+        private static string EscapeCsvField(string field)
         {
             if (string.IsNullOrEmpty(field)) return "";
-            if (field.Contains(",") || field.Contains("\"") || field.Contains("\n") || field.Contains("\r"))
+            if (field.Contains(',') || field.Contains('"') || field.Contains('\n') || field.Contains('\r'))
             {
                 return $"\"{field.Replace("\"", "\"\"")}\"";
             }
             return field;
         }
 
-        private TextBox GetCurrentQueryBox()
+        // ------------------------------------------------------------------
+        // Tabs
+        // ------------------------------------------------------------------
+
+        private TextBox? GetCurrentQueryBox()
         {
             if (QueryTabs.SelectedItem is TabItem currentTab)
             {
-                // If you set the TextBox as the Content of the TabItem
                 return currentTab.Content as TextBox;
             }
             return null;
+        }
+
+        private static string GetTabTitle(TabItem tab)
+        {
+            if (tab.Header is StackPanel sp && sp.Children.Count > 0 && sp.Children[0] is Label lbl)
+            {
+                return (lbl.Content as TextBlock)?.Text ?? lbl.Content?.ToString() ?? "Query";
+            }
+            return "Query";
         }
 
         private void AddNewTab_Click(object sender, RoutedEventArgs e)
@@ -1051,22 +1382,23 @@ namespace ODBSee
                 TextWrapping = TextWrapping.Wrap,
                 VerticalScrollBarVisibility = ScrollBarVisibility.Auto
             };
-            newBox.KeyDown += TxtQuery_KeyDown;
 
             var headerStack = new StackPanel { Orientation = Orientation.Horizontal };
 
             // FIX: Using Label because TextBlock does NOT have MouseDoubleClick
             var titleLabel = new Label
             {
-                Content = header,
+                Content = new TextBlock { Text = header }, // TextBlock, not a string: keeps "_" in names visible
                 VerticalAlignment = VerticalAlignment.Center,
                 Padding = new Thickness(0),
                 MinWidth = 40
             };
 
-            titleLabel.MouseDoubleClick += (s, e) =>
+            void StartRename()
             {
-                var editBox = new TextBox { Text = titleLabel.Content.ToString(), MinWidth = 60 };
+                if (!headerStack.Children.Contains(titleLabel)) return;
+
+                var editBox = new TextBox { Text = (titleLabel.Content as TextBlock)?.Text ?? "", MinWidth = 60 };
                 headerStack.Children.Insert(0, editBox);
                 headerStack.Children.Remove(titleLabel);
                 editBox.Focus();
@@ -1076,15 +1408,17 @@ namespace ODBSee
                 {
                     if (headerStack.Children.Contains(editBox))
                     {
-                        titleLabel.Content = string.IsNullOrWhiteSpace(editBox.Text) ? "Untitled" : editBox.Text;
+                        titleLabel.Content = new TextBlock { Text = string.IsNullOrWhiteSpace(editBox.Text) ? "Untitled" : editBox.Text };
                         headerStack.Children.Insert(0, titleLabel);
                         headerStack.Children.Remove(editBox);
                     }
                 }
 
-                editBox.KeyDown += (s2, e2) => { if (e2.Key == System.Windows.Input.Key.Enter) FinishRename(); };
+                editBox.KeyDown += (s2, e2) => { if (e2.Key == Key.Enter) FinishRename(); };
                 editBox.LostFocus += (s2, e2) => FinishRename();
-            };
+            }
+
+            titleLabel.MouseDoubleClick += (s, e) => StartRename();
 
             var closeBtn = new Button
             {
@@ -1094,16 +1428,37 @@ namespace ODBSee
                 Background = System.Windows.Media.Brushes.Transparent,
                 BorderThickness = new Thickness(0),
                 FontWeight = FontWeights.Bold,
-                VerticalAlignment = VerticalAlignment.Center
+                VerticalAlignment = VerticalAlignment.Center,
+                ToolTip = "Close tab (Ctrl+Shift+T reopens it)"
             };
 
             var newTab = new TabItem { Content = newBox, Tag = state };
 
-            closeBtn.Click += (s, e) =>
+            closeBtn.Click += (s, e) => CloseTab(newTab);
+
+            // Right-click menu on the tab header
+            var renameItem = new MenuItem { Header = "Rename" };
+            renameItem.Click += (s, e) => StartRename();
+            var clearItem = new MenuItem { Header = "Clear Results", ToolTip = "Free this tab's result data (query text is kept)" };
+            clearItem.Click += (s, e) => ClearResults(newTab);
+            var closeItem = new MenuItem { Header = "Close Tab" };
+            closeItem.Click += (s, e) => CloseTab(newTab);
+            var reopenItem = new MenuItem { Header = "Reopen Closed Tab", InputGestureText = "Ctrl+Shift+T" };
+            reopenItem.Click += (s, e) => ReopenClosedTab();
+
+            var tabMenu = new ContextMenu();
+            tabMenu.Items.Add(renameItem);
+            tabMenu.Items.Add(clearItem);
+            tabMenu.Items.Add(new Separator());
+            tabMenu.Items.Add(closeItem);
+            tabMenu.Items.Add(reopenItem);
+            tabMenu.Opened += (s, e) =>
             {
-                if (QueryTabs.Items.Count > 1)
-                    QueryTabs.Items.Remove(newTab);
+                closeItem.IsEnabled = QueryTabs.Items.Count > 1;
+                reopenItem.IsEnabled = _closedTabs.Count > 0;
+                clearItem.IsEnabled = state.CachedData.Count > 0 || state.ColumnNames.Count > 0;
             };
+            headerStack.ContextMenu = tabMenu;
 
             headerStack.Children.Add(titleLabel);
             headerStack.Children.Add(closeBtn);
@@ -1113,7 +1468,198 @@ namespace ODBSee
             QueryTabs.SelectedItem = newTab;
         }
 
-        private async void BtnCheckUpdate_MouseLeftButtonUp(object sender, System.Windows.Input.MouseButtonEventArgs e)
+        private void CloseTab(TabItem tab)
+        {
+            if (QueryTabs.Items.Count <= 1 || !QueryTabs.Items.Contains(tab)) return;
+
+            QueryTabs.Items.Remove(tab);
+
+            // Keep it (with its results) so Ctrl+Shift+T can bring it back; older ones are dropped to free memory
+            _closedTabs.AddFirst(tab);
+            while (_closedTabs.Count > MaxClosedTabs)
+            {
+                var dropped = _closedTabs.Last!.Value;
+                _closedTabs.RemoveLast();
+                if (dropped.Tag is TabState droppedState)
+                {
+                    droppedState.CachedData = new List<string[]>();
+                    droppedState.ColumnNames = new List<string>();
+                }
+            }
+
+            LogStatus($"Closed '{GetTabTitle(tab)}'. Press Ctrl+Shift+T to reopen.");
+        }
+
+        private void ReopenClosedTab()
+        {
+            if (_closedTabs.Count == 0) return;
+
+            var tab = _closedTabs.First!.Value;
+            _closedTabs.RemoveFirst();
+
+            QueryTabs.Items.Add(tab);
+            QueryTabs.SelectedItem = tab;
+            LogStatus($"Reopened '{GetTabTitle(tab)}'.");
+        }
+
+        private void ClearResults(TabItem tab)
+        {
+            if (tab.Tag is not TabState state) return;
+
+            var rowCount = state.CachedData.Count;
+            state.CachedData = new List<string[]>();
+            state.ColumnNames = new List<string>();
+            state.LastSortColumnIndex = -1;
+            state.SortAscending = true;
+
+            if (QueryTabs.SelectedItem == tab)
+            {
+                RefreshGridFromState(state);
+            }
+
+            // Big result sets live on the large object heap; collect now so the memory is actually returned
+            GC.Collect();
+            LogStatus($"Cleared {rowCount} rows from '{GetTabTitle(tab)}'.");
+        }
+
+        // ------------------------------------------------------------------
+        // Status bar: logs, settings, feedback, updates
+        // ------------------------------------------------------------------
+
+        private void StatusInfo_MouseLeftButtonUp(object sender, MouseButtonEventArgs e)
+        {
+            var logWindow = new Window
+            {
+                Title = "ODBSee Log History",
+                Width = 650,
+                Height = 450,
+                WindowStartupLocation = WindowStartupLocation.CenterOwner,
+                Owner = this,
+                ShowInTaskbar = false
+            };
+            logWindow.SetResourceReference(BackgroundProperty, "Brush.Panel");
+            logWindow.SetResourceReference(ForegroundProperty, "Brush.Text");
+
+            var grid = new Grid { Margin = new Thickness(12) };
+            grid.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
+            grid.RowDefinitions.Add(new RowDefinition { Height = new GridLength(1, GridUnitType.Star) });
+            grid.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
+
+            var header = new TextBlock
+            {
+                Text = "ODBSee Activity Logs (Last 50 messages)",
+                FontSize = 14,
+                FontWeight = FontWeights.Bold,
+                Margin = new Thickness(0, 0, 0, 10)
+            };
+            Grid.SetRow(header, 0);
+            grid.Children.Add(header);
+
+            string logsText;
+            lock (_logLock)
+            {
+                logsText = string.Join(Environment.NewLine, _logHistory);
+            }
+
+            var logBox = new TextBox
+            {
+                Text = string.IsNullOrEmpty(logsText) ? "No log history recorded yet." : logsText,
+                IsReadOnly = true,
+                FontFamily = new System.Windows.Media.FontFamily("Consolas"),
+                FontSize = 11,
+                AcceptsReturn = true,
+                VerticalScrollBarVisibility = ScrollBarVisibility.Auto,
+                HorizontalScrollBarVisibility = ScrollBarVisibility.Auto,
+                Padding = new Thickness(8),
+                BorderThickness = new Thickness(1)
+            };
+            logBox.SetResourceReference(BackgroundProperty, "Brush.Code");
+            logBox.SetResourceReference(ForegroundProperty, "Brush.Text");
+            logBox.SetResourceReference(BorderBrushProperty, "Brush.BorderStrong");
+            Grid.SetRow(logBox, 1);
+            grid.Children.Add(logBox);
+
+            var btnPanel = new StackPanel
+            {
+                Orientation = Orientation.Horizontal,
+                HorizontalAlignment = System.Windows.HorizontalAlignment.Right,
+                Margin = new Thickness(0, 12, 0, 0)
+            };
+            Grid.SetRow(btnPanel, 2);
+            grid.Children.Add(btnPanel);
+
+            var copyBtn = new Button
+            {
+                Content = "Copy to Clipboard",
+                Padding = new Thickness(12, 6, 12, 6),
+                Margin = new Thickness(0, 0, 10, 0)
+            };
+            copyBtn.Click += (s2, e2) =>
+            {
+                try
+                {
+                    System.Windows.Clipboard.SetText(logsText);
+                    MessageBox.Show("Logs copied to clipboard!", "Copied", MessageBoxButton.OK, MessageBoxImage.Information);
+                }
+                catch (Exception ex)
+                {
+                    MessageBox.Show($"Failed to copy logs: {ex.Message}", "Error", MessageBoxButton.OK, MessageBoxImage.Error);
+                }
+            };
+            btnPanel.Children.Add(copyBtn);
+
+            var closeBtn = new Button
+            {
+                Content = "Close",
+                Padding = new Thickness(18, 6, 18, 6),
+                IsDefault = true
+            };
+            closeBtn.Click += (s2, e2) => logWindow.Close();
+            btnPanel.Children.Add(closeBtn);
+
+            logWindow.Content = grid;
+            logWindow.ShowDialog();
+        }
+
+        private void BtnSettings_MouseLeftButtonUp(object sender, MouseButtonEventArgs e)
+        {
+            var window = new SettingsWindow(_settings) { Owner = this };
+            if (window.ShowDialog() == true)
+            {
+                // Re-save the session so a change to "Remember passwords" takes effect on disk right away
+                SaveSession();
+                if (_settings.Theme != ThemeManager.CurrentSetting) ThemeManager.Apply(_settings.Theme);
+                LogStatus($"Settings saved (connect timeout {_settings.ConnectTimeoutSeconds}s, query timeout {_settings.CommandTimeoutSeconds}s).");
+            }
+        }
+
+        private void BtnFeedback_MouseLeftButtonUp(object sender, MouseButtonEventArgs e)
+        {
+            var window = new FeedbackWindow(_settings.GitHubToken) { Owner = this };
+            if (window.ShowDialog() == true && !string.IsNullOrEmpty(window.ResultMessage))
+            {
+                LogStatus(window.ResultMessage);
+            }
+        }
+
+        private async Task RetryPendingFeedbackAsync()
+        {
+            try
+            {
+                var token = _settings.GitHubToken;
+                if (string.IsNullOrWhiteSpace(token) || FeedbackService.PendingCount == 0) return;
+
+                var (sent, remaining) = await FeedbackService.RetryPendingAsync(token);
+                if (sent > 0) LogStatus($"Sent {sent} saved feedback item(s) to GitHub.");
+                if (remaining > 0) LogStatus($"{remaining} feedback item(s) still waiting to be sent.");
+            }
+            catch (Exception ex)
+            {
+                LogStatus($"Retrying saved feedback failed: {ex.Message}");
+            }
+        }
+
+        private async void BtnCheckUpdate_MouseLeftButtonUp(object sender, MouseButtonEventArgs e)
         {
             LogStatus("Checking for updates on GitHub...");
             BtnCheckUpdate.Text = "Checking...";
@@ -1189,7 +1735,7 @@ namespace ODBSee
             {
                 LogStatus($"Update check failed: {ex.Message}");
                 BtnCheckUpdate.Text = "Check for Updates";
-                BtnCheckUpdate.Foreground = new System.Windows.Media.SolidColorBrush((System.Windows.Media.Color)System.Windows.Media.ColorConverter.ConvertFromString("#007ACC"));
+                BtnCheckUpdate.SetResourceReference(ForegroundProperty, "Brush.Link");
                 BtnCheckUpdate.ToolTip = "Click to check for updates on GitHub";
                 MessageBox.Show($"Update check failed: {ex.Message}{Environment.NewLine}Please check your internet connection.", "Update Check Failed", MessageBoxButton.OK, MessageBoxImage.Warning);
             }

@@ -21,7 +21,7 @@
     <DebugSymbols>false</DebugSymbols>
 	  
 	  <!--UPDATE THIS WHEN UPDATING .EXE RELEASE!!!-->
-	<Version>1.2.2</Version>
+	<Version>1.3.0</Version>
 	  
   </PropertyGroup>
 
@@ -31,6 +31,7 @@
 
   <ItemGroup>
     <PackageReference Include="System.Data.Odbc" Version="10.0.1" />
+    <PackageReference Include="System.Security.Cryptography.ProtectedData" Version="10.0.1" />
   </ItemGroup>
 
 </Project>
